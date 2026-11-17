@@ -1,0 +1,14 @@
+{
+  "name": "makefun-github-core-clone-01",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A dependency-free in-memory GitHub-compatible forge for make.fun",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}

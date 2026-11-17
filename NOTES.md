@@ -93,3 +93,60 @@ restart-persistence gate applies; state is intentionally process-local and in me
 - Static secret-pattern and dangerous-API searches passed. `gitleaks`, `trufflehog`, `semgrep`, and
   `osv-scanner` were not installed; dependency scanning is not applicable because the entry has no
   dependencies or lockfile.
+
+## Perf push (2026-11-17)
+
+Every run below is a full local suite (`sdk/run.ts --perf --json`) against a fresh entry process started
+through `main.ts` with a stub env; Feature `600`, Agent `200` and `120 / 120` checks held in every run.
+
+Two Node 22 runtimes were used, because they disagree:
+
+- macOS host, `/opt/homebrew/Cellar/node@22/22.23.2_2/bin/node` (`v22.23.2`, bundled undici `6.28.0`),
+  with an unrelated virtual machine holding one core throughout.
+- Linux container `node:22-alpine` (`v22.23.4`, bundled undici `6.29.1`, arm64) at `--cpus 2 -m 1024m`.
+
+### Baseline at `b1a60fa`
+
+| Runtime | Score | Perf | push p50 | clone p50 | read p50 | write p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| macOS v22.23.2 (3 runs) | 930-933 | 130-133 | 812 ms | 16.9-18.1 ms | 3301-3472 ms | 382-387 ms |
+| Linux v22.23.4 (2 runs) | 997-998 | 197-198 | 166-172 ms | 74.6-77.1 ms | 269-282 ms | 39-51 ms |
+
+The 948 recorded above was not reproduced on the macOS host today (host contention, as in the earlier
+"optimized hot-path pass").
+
+### Where the time goes
+
+- On v22.23.2 the suite's own client is the cost. undici `6.28.0` defers every reuse of an idle
+  keep-alive socket behind `setTimeout(0)` (`scheduleIdleSocketValidation`), so each sequential request
+  waits about 1.44 ms before it is even written: 2,000 fetches of a canned raw-socket response take
+  3.2-3.6 s there, against 0.11 s on Node 26 and 0.06 s for a raw socket ping-pong. undici `6.29.1`
+  (v22.23.4) uses `setImmediate` instead and the wait is gone.
+- The entry process is idle 83-85 % of a whole suite run; `app.ts` and `forge.ts` together account for
+  about 50 ms of self time. With a lean keep-alive client a round trip is 36 µs for an issue read and
+  46 µs for an issue create, against a 29 µs raw-socket floor and 34 µs for `/healthz`.
+
+### Changes
+
+- Kept, `0c3b827`: upload-pack fetch answers are cached per repository. Linux clone p50 74.6-77.1 ms ->
+  64.7-65.6 ms (69.3 ms under the CPU profiler) and Perf 197-198 -> 200 (199 under the profiler); macOS clone p50 16.9-18.1 ms -> 14.6-18.5 ms with the
+  score unchanged at 933 (clone was already at its cap there).
+- Reverted: an event-based request-body reader (create round trip 46.3 -> 46.7-47.5 µs; no score change).
+- Reverted: a single-write string body on the issue path (read round trip 35.8 -> 36.0 µs; no score change).
+- Not merged, branch `perf/connection-close-experiment` (`056757e`): `Connection: close` on every reply.
+  macOS v22.23.2: 933 -> 1000 (push 98 ms, clone 28 ms, read 256 ms, write 29 ms), because a fresh
+  connection skips the 1 ms timer. Linux v22.23.4: Perf 198 -> 194 (push 210 ms, clone 93 ms, read 422 ms,
+  write 70 ms). It also contradicts the rules' "on one keep-alive connection" read workload and lets an
+  early 401/404 reply reset a large upload, so it stays off `main`.
+
+### Final at `0c3b827`
+
+| Runtime | Score | Perf | push p50 | clone p50 | read p50 | write p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| macOS v22.23.2 (2 runs) | 933 | 133 | 828-864 ms | 14.6-18.5 ms | 3285-3303 ms | 370-374 ms |
+| Linux v22.23.4 (1 run) | 1000 | 200 | 169 ms | 65.5 ms | 277 ms | 39.9 ms |
+
+The ceiling on v22.23.2 with keep-alive is the client's timer: read cannot go below roughly 2,000 x 1.4 ms,
+and 50 points needs 690 ms. The kit does not state the grader's Node patch release, but the trial image
+its CLI pins (`node@sha256:de170b39439e...`, referenced in `cli/makefun.mjs`) is `v22.23.4` with undici
+`6.29.1`, the same runtime as the Linux measurements above.

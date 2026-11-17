@@ -840,6 +840,34 @@ function fetchResponse(repo: Repository, lines: Buffer[]): Buffer {
   return Buffer.concat(rows);
 }
 
+/** How many distinct fetch requests a repository remembers the answer to. */
+const FETCH_CACHE_ENTRIES = 16;
+/** The largest answer worth remembering; a bigger pack is rebuilt on demand. */
+const FETCH_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const fetchCache = new WeakMap<Repository, { generation: number; objects: number; answers: Map<string, Buffer> }>();
+
+/**
+ * fetchResponse, remembered per repository. An answer is a pure function of the request's arguments
+ * and the (append-only, content-addressed) object store, so identical fetches of an unchanged
+ * repository reuse one packfile instead of re-deflating and re-hashing it for every clone.
+ */
+function cachedFetchResponse(repo: Repository, lines: Buffer[]): Buffer {
+  let entry = fetchCache.get(repo);
+  if (!entry || entry.generation !== repo.generation || entry.objects !== repo.objects.size) {
+    entry = { generation: repo.generation, objects: repo.objects.size, answers: new Map() };
+    fetchCache.set(repo, entry);
+  }
+  const key = lines.map((line) => line.toString('latin1')).join('\0');
+  const cached = entry.answers.get(key);
+  if (cached) return cached;
+  const answer = fetchResponse(repo, lines);
+  if (answer.length <= FETCH_CACHE_MAX_BYTES) {
+    if (entry.answers.size >= FETCH_CACHE_ENTRIES) entry.answers.clear();
+    entry.answers.set(key, answer);
+  }
+  return answer;
+}
+
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repository): Promise<void> {
   try {
     const decoded = decodeUntilFlush(await readBody(req));
@@ -852,7 +880,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
     }
     if (first === 'command=fetch') {
       const args = decoded.rest.length ? decodeUntilFlush(decoded.rest).lines : decoded.lines;
-      sendBytes(res, 200, fetchResponse(repo, args), gitContentType('git-upload-pack', 'result'));
+      sendBytes(res, 200, cachedFetchResponse(repo, args), gitContentType('git-upload-pack', 'result'));
       return;
     }
     sendBytes(res, 400, Buffer.from('invalid upload-pack request'), 'text/plain');

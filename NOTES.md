@@ -150,3 +150,64 @@ The ceiling on v22.23.2 with keep-alive is the client's timer: read cannot go be
 and 50 points needs 690 ms. The kit does not state the grader's Node patch release, but the trial image
 its CLI pins (`node@sha256:de170b39439e...`, referenced in `cli/makefun.mjs`) is `v22.23.4` with undici
 `6.29.1`, the same runtime as the Linux measurements above.
+
+## Perf Round 2 (2026-11-18)
+
+Baseline `0922ab3`. The official Docker grader used its pinned Node `v22.23.4` image and
+`TMPDIR=$HOME/makefun-grade-tmp/`. The SDK used `sdk/run.ts --perf --json`, a fresh entry process
+through `main.ts`, and one `node:22-alpine` container with Node `v22.23.4`, undici `6.29.1`, two CPUs,
+and 1,024 MiB. Each timing was checked against host load before launch. Baseline and candidate
+order alternated in the final five pairs. Each column is the median of the corresponding per-run
+value. The aggregate is the median of the reported `perf_p50_us` values.
+
+| Gate | Source | Runs | Push (ms) | Clone (ms) | Read (ms) | Write (ms) | `perf_p50_us` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Official Docker | Initial baseline | 3 | 156.957 | 59.468 | 254.003 | 45.614 | 102,553 |
+| Official Docker | Paired baseline | 5 | 161.532 | 61.913 | 264.459 | 42.354 | 102,295 |
+| Official Docker | Final implementation | 5 | 141.849 | 60.027 | 257.682 | 38.565 | 97,283 |
+| Linux SDK | Initial baseline | 5 | 167.426 | 61.659 | 262.168 | 39.423 | 104,437 |
+| Linux SDK | Paired baseline | 5 | 167.044 | 60.646 | 281.365 | 37.062 | 101,833 |
+| Linux SDK | Final implementation | 5 | 147.009 | 61.368 | 270.425 | 34.707 | 95,227 |
+
+All final comparison runs scored Feature 600, Agent 200, and Perf 200. Official live and replay
+state exports matched. The paired aggregate fell 4.9% in the official grader and 6.5% in the SDK.
+The official median fell short of the 10% target. The SDK clone median moved 1.2% higher in the
+final comparison despite the isolated cache win.
+
+### Profile and changes
+
+V8 sampled the entry separately for each workload on Linux, after the first timed round of a
+12-round run. Node HTTP writes dominated sampled read CPU. Clone still spent CPU producing Git v2
+advertisements and parsing upload-pack requests. Push also showed substantial garbage collection.
+Across the combined trial profile, sampled non-idle entry time per push round fell from about 23 to
+9 ms and per clone round from about 16 to 5 ms. These profile timings are separate from scoring.
+
+- Consume request buffers directly and only join when the body arrives in multiple chunks. The
+  reader still rejects on abort, stream error, or any body over the original 64 MiB limit. Isolated
+  SDK write p50 moved from 38.310 to 34.011 ms across five runs per source.
+- Cache successful Git and issue routes by exact request target, verify the method and bearer on
+  every hit, and use the live repository and issue. Deleting a repository releases cached routes.
+  The route-only SDK trial moved push from 165.924 to 161.039 ms and clone from 60.542 to 57.512 ms.
+- Reuse the static v2 advertisement and cache successful `ls-refs` and fetch replies by exact
+  request bytes per repository. Ref and object changes invalidate those replies, including valid
+  packs with refused ref updates. The protocol trial reduced clone from 62.038 to 54.894 ms over
+  the body-reader variant.
+- Match zlib output allocation to small object sizes and use one-shot SHA-1 on pack checksums and
+  small Git objects. A separate 400-object round trip retained 432 KiB of backing buffers versus
+  6,400 KiB, with identical decoded data and object IDs. Ten pack reads took a median 28.5 ms of
+  process CPU versus 39.3 ms. Pack validation and staged installation still precede ref updates.
+- Encode text pkt-lines without intermediate packet buffers for v0 advertisements and receive-pack
+  reports. Combined with the small-object hash path, the five-run SDK push median fell from
+  157.374 to 148.081 ms over the preceding candidate.
+
+### Experiments dropped and gates
+
+- Generic response header arrays and string framing showed no SDK aggregate gain (101,695 to
+  101,824 µs). Prebuilding the same framing for cached Git replies left clone effectively flat
+  (59.619 to 59.653 ms). Both experiments were dropped.
+- Replacing the pack's staging map with a list gave up deduplication of repeated objects during
+  validation. The map was restored before the final measurements.
+- The SDK passed 120/120 conformance checks and 15/15 MCP checks. A differential probe matched
+  39 status, header, and body records against the baseline, including exact authorization,
+  split and aborted bodies, Unicode refs, checksum rejection, mixed push status, and cache
+  behavior after repository deletion and recreation. TypeScript and Node 22 syntax checks passed.

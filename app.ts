@@ -3,6 +3,7 @@ import {
   DELIM,
   FLUSH,
   ForgeStore,
+  V2_ADVERTISEMENT,
   ZERO_OID,
   commitHistory,
   commitInfo,
@@ -11,12 +12,12 @@ import {
   deleteFile,
   filesAt,
   pkt,
+  pktText,
   putFile,
   readPack,
   sidebandPack,
   tagTarget,
   v0Advertisement,
-  v2Advertisement,
   writePack,
   type IssueRecord,
   type PullRecord,
@@ -25,6 +26,7 @@ import {
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const AUTHORIZATION = `Bearer ${TOKEN}`;
 const store = new ForgeStore();
 const issueBodyCache = new WeakMap<IssueRecord, { state: IssueRecord['state']; body: Buffer }>();
 
@@ -52,6 +54,12 @@ function sendBytes(res: ServerResponse, status: number, body: Buffer, type: stri
   res.end(body);
 }
 
+function sendGitText(res: ServerResponse, body: string, type: string): void {
+  res.sendDate = false;
+  res.writeHead(200, { 'content-type': type, 'content-length': Buffer.byteLength(body) });
+  res.end(body);
+}
+
 /** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
 function pathOf(req: IncomingMessage): string {
   try {
@@ -61,20 +69,32 @@ function pathOf(req: IncomingMessage): string {
   }
 }
 
-async function readBody(req: IncomingMessage, limit = 64 * 1024 * 1024): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const data = Buffer.from(chunk);
-    size += data.length;
-    if (size > limit) throw new Error('body too large');
-    chunks.push(data);
-  }
-  return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+const EMPTY_BODY = Buffer.alloc(0);
+
+function readBody(req: IncomingMessage, limit = 64 * 1024 * 1024): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    let first: Buffer | undefined;
+    let chunks: Buffer[] | undefined;
+    let size = 0;
+    req.once('error', reject);
+    req.once('aborted', () => reject(new Error('request aborted')));
+    req.once('end', () => resolve(chunks ? Buffer.concat(chunks, size) : first ?? EMPTY_BODY));
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        reject(new Error('body too large'));
+        req.destroy();
+      } else if (!first) {
+        first = chunk;
+      } else {
+        (chunks ??= [first]).push(chunk);
+      }
+    });
+  });
 }
 
 function authorised(req: IncomingMessage): boolean {
-  return TOKEN !== '' && req.headers.authorization === `Bearer ${TOKEN}`;
+  return TOKEN !== '' && req.headers.authorization === AUTHORIZATION;
 }
 
 function repoJson(repo: Repository): Record<string, unknown> {
@@ -725,7 +745,11 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const body = await jsonBody(req);
         if (typeof body.description === 'string') repo.description = body.description;
         sendJson(res, 200, repoJson(repo));
-      } else if (method === 'DELETE') { store.repos.delete(repo.name); sendEmpty(res, 204); }
+      } else if (method === 'DELETE') {
+        store.repos.delete(repo.name);
+        hotRoutes.clear();
+        sendEmpty(res, 204);
+      }
       else return false;
       return true;
     }
@@ -736,31 +760,51 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
   return false;
 }
 
-/** Fast dispatch for ordinary single-issue reads and issue creation. */
-async function handleIssueHotPath(req: IncomingMessage, res: ServerResponse, path: string, method: string): Promise<boolean> {
+async function postIssue(req: IncomingMessage, res: ServerResponse, repo: Repository): Promise<void> {
   try {
-    if (method === 'GET') {
-      const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(path);
-      if (!match) return false;
-      const issue = repoFromMatch(match)?.issues.get(Number(match[3]));
-      if (!issue) sendJson(res, 404, { message: 'Not Found' });
-      else sendIssue(res, 200, issue);
-      return true;
-    }
-    if (method === 'POST') {
-      const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/.exec(path);
-      if (!match) return false;
-      const repo = repoFromMatch(match);
-      if (!repo) sendJson(res, 404, { message: 'Not Found' });
-      else {
-        const issue = createIssue(repo, await jsonBody(req));
-        if (!issue) sendJson(res, 422, { message: 'Validation Failed: label does not exist' });
-        else sendIssue(res, 201, issue);
-      }
-      return true;
-    }
+    const issue = createIssue(repo, await jsonBody(req));
+    if (!issue) sendJson(res, 422, { message: 'Validation Failed: label does not exist' });
+    else sendIssue(res, 201, issue);
   } catch {
     sendJson(res, 400, { message: 'Problems parsing JSON' });
+  }
+}
+
+type HotHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+const hotRoutes = new Map<string, { method: string; repo: Repository; handle: HotHandler }>();
+
+function runHotRoute(req: IncomingMessage, res: ServerResponse, method: string, repo: Repository, handle: HotHandler): void | Promise<void> {
+  const target = req.url;
+  if (target !== undefined && target.length <= 1024) {
+    if (hotRoutes.size >= 256) hotRoutes.clear();
+    hotRoutes.set(target, { method, repo, handle });
+  }
+  return handle(req, res);
+}
+
+/** Fast dispatch for ordinary single-issue reads and issue creation. */
+async function handleIssueHotPath(req: IncomingMessage, res: ServerResponse, path: string, method: string): Promise<boolean> {
+  if (method === 'GET') {
+    const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(path);
+    if (!match) return false;
+    const repo = repoFromMatch(match);
+    const issue = repo?.issues.get(Number(match[3]));
+    if (!repo || !issue) sendJson(res, 404, { message: 'Not Found' });
+    else runHotRoute(req, res, method, repo, (_req, response) => {
+      try {
+        sendIssue(response, 200, issue);
+      } catch {
+        sendJson(response, 400, { message: 'Problems parsing JSON' });
+      }
+    });
+    return true;
+  }
+  if (method === 'POST') {
+    const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/.exec(path);
+    if (!match) return false;
+    const repo = repoFromMatch(match);
+    if (!repo) sendJson(res, 404, { message: 'Not Found' });
+    else await runHotRoute(req, res, method, repo, (request, response) => postIssue(request, response, repo));
     return true;
   }
   return false;
@@ -782,11 +826,12 @@ function gitContentType(service: string, kind: 'advertisement' | 'result'): stri
 
 function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repository, service: 'git-upload-pack' | 'git-receive-pack'): void {
   const wantsV2 = service === 'git-upload-pack' && String(req.headers['git-protocol'] ?? '').includes('version=2');
-  const body = wantsV2 ? v2Advertisement() : v0Advertisement(repo, service);
-  sendBytes(res, 200, body, gitContentType(service, 'advertisement'));
+  const type = gitContentType(service, 'advertisement');
+  if (wantsV2) sendBytes(res, 200, V2_ADVERTISEMENT, type);
+  else sendGitText(res, v0Advertisement(repo, service), type);
 }
 
-function handleLsRefs(res: ServerResponse, repo: Repository, lines: Buffer[]): void {
+function lsRefsResponse(repo: Repository, lines: Buffer[]): Buffer {
   const prefixes = lines.map((line) => line.toString()).filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice(11).trim());
   const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
   const rows: Buffer[] = [];
@@ -798,7 +843,7 @@ function handleLsRefs(res: ServerResponse, repo: Repository, lines: Buffer[]): v
     rows.push(pkt(`${oid} ${name}${target ? ` peeled:${target}` : ''}\n`));
   }
   rows.push(FLUSH);
-  sendBytes(res, 200, Buffer.concat(rows), gitContentType('git-upload-pack', 'result'));
+  return Buffer.concat(rows);
 }
 
 function fetchResponse(repo: Repository, lines: Buffer[]): Buffer {
@@ -840,29 +885,36 @@ function fetchResponse(repo: Repository, lines: Buffer[]): Buffer {
   return Buffer.concat(rows);
 }
 
-/** How many distinct fetch requests a repository remembers the answer to. */
-const FETCH_CACHE_ENTRIES = 16;
-/** The largest answer worth remembering; a bigger pack is rebuilt on demand. */
-const FETCH_CACHE_MAX_BYTES = 4 * 1024 * 1024;
-const fetchCache = new WeakMap<Repository, { generation: number; objects: number; answers: Map<string, Buffer> }>();
+const UPLOAD_CACHE_ENTRIES = 16;
+const UPLOAD_CACHE_MAX_REQUEST_BYTES = 4 * 1024;
+const UPLOAD_CACHE_MAX_ANSWER_BYTES = 4 * 1024 * 1024;
+const uploadCache = new WeakMap<Repository, { generation: number; objects: number; answers: Map<string, Buffer> }>();
+
+function uploadResponse(repo: Repository, body: Buffer): Buffer {
+  const decoded = decodeUntilFlush(body);
+  const command = decoded.lines[0]?.toString().trim();
+  if (command !== 'command=ls-refs' && command !== 'command=fetch') throw new Error('invalid upload-pack request');
+  const args = decoded.rest.length ? decodeUntilFlush(decoded.rest).lines : decoded.lines;
+  return command === 'command=ls-refs' ? lsRefsResponse(repo, args) : fetchResponse(repo, args);
+}
 
 /**
- * fetchResponse, remembered per repository. An answer is a pure function of the request's arguments
- * and the (append-only, content-addressed) object store, so identical fetches of an unchanged
- * repository reuse one packfile instead of re-deflating and re-hashing it for every clone.
+ * Cache successful upload-pack replies by exact request bytes. Ref updates and new objects can
+ * each change a reply, including objects stored by a push whose ref update was refused.
  */
-function cachedFetchResponse(repo: Repository, lines: Buffer[]): Buffer {
-  let entry = fetchCache.get(repo);
+function cachedUploadResponse(repo: Repository, body: Buffer): Buffer {
+  if (body.length > UPLOAD_CACHE_MAX_REQUEST_BYTES) return uploadResponse(repo, body);
+  let entry = uploadCache.get(repo);
   if (!entry || entry.generation !== repo.generation || entry.objects !== repo.objects.size) {
     entry = { generation: repo.generation, objects: repo.objects.size, answers: new Map() };
-    fetchCache.set(repo, entry);
+    uploadCache.set(repo, entry);
   }
-  const key = lines.map((line) => line.toString('latin1')).join('\0');
+  const key = body.toString('latin1');
   const cached = entry.answers.get(key);
   if (cached) return cached;
-  const answer = fetchResponse(repo, lines);
-  if (answer.length <= FETCH_CACHE_MAX_BYTES) {
-    if (entry.answers.size >= FETCH_CACHE_ENTRIES) entry.answers.clear();
+  const answer = uploadResponse(repo, body);
+  if (answer.length <= UPLOAD_CACHE_MAX_ANSWER_BYTES) {
+    if (entry.answers.size >= UPLOAD_CACHE_ENTRIES) entry.answers.clear();
     entry.answers.set(key, answer);
   }
   return answer;
@@ -870,32 +922,26 @@ function cachedFetchResponse(repo: Repository, lines: Buffer[]): Buffer {
 
 async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repository): Promise<void> {
   try {
-    const decoded = decodeUntilFlush(await readBody(req));
-    const first = decoded.lines[0]?.toString().trim() ?? '';
-    if (first === 'command=ls-refs') {
-      let args = decoded.lines;
-      if (decoded.rest.length) args = decodeUntilFlush(decoded.rest).lines;
-      handleLsRefs(res, repo, args);
-      return;
-    }
-    if (first === 'command=fetch') {
-      const args = decoded.rest.length ? decodeUntilFlush(decoded.rest).lines : decoded.lines;
-      sendBytes(res, 200, cachedFetchResponse(repo, args), gitContentType('git-upload-pack', 'result'));
-      return;
-    }
-    sendBytes(res, 400, Buffer.from('invalid upload-pack request'), 'text/plain');
+    const answer = cachedUploadResponse(repo, await readBody(req));
+    sendBytes(res, 200, answer, gitContentType('git-upload-pack', 'result'));
   } catch {
     sendBytes(res, 400, Buffer.from('invalid upload-pack request'), 'text/plain');
   }
 }
 
+const RECEIVE_PACK_RESULT = gitContentType('git-receive-pack', 'result');
+const UNPACK_OK = pktText('unpack ok\n');
+const UNPACK_ERROR = pktText(`\x01${pktText('unpack error\n')}0000`) + '0000';
+
 async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo: Repository): Promise<void> {
   try {
     const decoded = decodeUntilFlush(await readBody(req));
     if (decoded.rest.length) {
-      for (const [oid, object] of readPack(decoded.rest)) repo.objects.set(oid, object);
+      const objects = readPack(decoded.rest);
+      for (const [oid, object] of objects) repo.objects.set(oid, object);
+      if (objects.size) repo.generation += 1;
     }
-    const reports: Array<{ ref: string; ok: boolean; reason?: string }> = [];
+    const reports: string[] = [];
     for (let index = 0; index < decoded.lines.length; index += 1) {
       const line = decoded.lines[index].toString('utf8').replace(/\n$/, '').split('\0')[0];
       const [oldOid, newOid, ref] = line.split(' ');
@@ -904,91 +950,96 @@ async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo
       if (current !== oldOid) reason = 'stale-info';
       else if (newOid !== ZERO_OID && !repo.objects.has(newOid)) reason = 'missing-object';
       else if (oldOid !== ZERO_OID && newOid !== ZERO_OID && ref.startsWith('refs/heads/') && !repo.isAncestor(oldOid, newOid)) reason = 'non-fast-forward';
-      if (reason) reports.push({ ref, ok: false, reason });
+      if (reason) reports.push(pktText(`ng ${ref} ${reason}\n`));
       else {
         if (newOid === ZERO_OID) repo.refs.delete(ref);
         else repo.refs.set(ref, newOid);
         repo.generation += 1;
-        reports.push({ ref, ok: true });
+        reports.push(pktText(`ok ${ref}\n`));
       }
     }
-    const inner = Buffer.concat([
-      pkt('unpack ok\n'),
-      ...reports.map((report) => pkt(report.ok ? `ok ${report.ref}\n` : `ng ${report.ref} ${report.reason}\n`)),
-      FLUSH,
-    ]);
-    const outer = Buffer.concat([pkt(Buffer.concat([Buffer.from([1]), inner])), FLUSH]);
-    sendBytes(res, 200, outer, gitContentType('git-receive-pack', 'result'));
+    const report = pktText(`\x01${UNPACK_OK}${reports.join('')}0000`) + '0000';
+    sendGitText(res, report, RECEIVE_PACK_RESULT);
   } catch {
-    const inner = Buffer.concat([pkt('unpack error\n'), FLUSH]);
-    sendBytes(res, 200, Buffer.concat([pkt(Buffer.concat([Buffer.from([1]), inner])), FLUSH]), gitContentType('git-receive-pack', 'result'));
+    sendGitText(res, UNPACK_ERROR, RECEIVE_PACK_RESULT);
   }
+}
+
+async function dispatchRequest(req: IncomingMessage, res: ServerResponse, method: string): Promise<void> {
+  const path = pathOf(req);
+
+  // The env's boot check calls this twice: 200 {"ok":true}.
+  if (method === 'GET' && path === '/healthz') {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  const git = parseGitPath(path);
+  if (git) {
+    if (!authorised(req)) {
+      sendJson(res, 401, { message: 'Bad credentials' });
+      return;
+    }
+    const repo = store.get(git.owner, git.name);
+    if (!repo) {
+      sendJson(res, 404, { message: 'Not Found' });
+      return;
+    }
+    if (method === 'GET' && git.suffix === 'info/refs') {
+      const service = new URL(req.url ?? '/', 'http://entry').searchParams.get('service');
+      if (service === 'git-upload-pack' || service === 'git-receive-pack') {
+        runHotRoute(req, res, method, repo, (request, response) => handleInfoRefs(request, response, repo, service));
+      } else sendJson(res, 404, { message: 'Not Found' });
+      return;
+    }
+    if (method === 'POST' && git.suffix === 'git-upload-pack') {
+      await runHotRoute(req, res, method, repo, (request, response) => handleUploadPack(request, response, repo));
+      return;
+    }
+    if (method === 'POST' && git.suffix === 'git-receive-pack') {
+      await runHotRoute(req, res, method, repo, (request, response) => handleReceivePack(request, response, repo));
+      return;
+    }
+  }
+
+  if (path === '/api/graphql' && method === 'POST') {
+    await handleGraphQL(req, res);
+    return;
+  }
+
+  if (path === '/mcp' && method === 'POST') {
+    await handleMcp(req, res);
+    return;
+  }
+
+  if (path.startsWith('/api/v3') && !authorised(req)) {
+    sendJson(res, 401, { message: 'Bad credentials' });
+    return;
+  }
+
+  if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
+    sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+    return;
+  }
+
+  if (path.startsWith('/api/v3') && await handleIssueHotPath(req, res, path, method)) return;
+
+  if (path.startsWith('/api/v3') && await handleRest(req, res, path, method)) return;
+
+  sendJson(res, 404, { message: 'Not Found' });
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
+  return createServer((req, res) => {
     const method = req.method ?? 'GET';
-
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
+    const route = req.url === undefined ? undefined : hotRoutes.get(req.url);
+    // A deleted and recreated name gets a fresh repository. A cached issue still uses its live state.
+    if (route?.method === method && store.repos.get(route.repo.name) === route.repo) {
+      if (!authorised(req)) sendJson(res, 401, { message: 'Bad credentials' });
+      else return route.handle(req, res);
       return;
     }
-
-    const git = parseGitPath(path);
-    if (git) {
-      if (!authorised(req)) {
-        sendJson(res, 401, { message: 'Bad credentials' });
-        return;
-      }
-      const repo = store.get(git.owner, git.name);
-      if (!repo) {
-        sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
-      const url = new URL(req.url ?? '/', 'http://entry');
-      if (method === 'GET' && git.suffix === 'info/refs') {
-        const service = url.searchParams.get('service');
-        if (service === 'git-upload-pack' || service === 'git-receive-pack') handleInfoRefs(req, res, repo, service);
-        else sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
-      if (method === 'POST' && git.suffix === 'git-upload-pack') {
-        await handleUploadPack(req, res, repo);
-        return;
-      }
-      if (method === 'POST' && git.suffix === 'git-receive-pack') {
-        await handleReceivePack(req, res, repo);
-        return;
-      }
-    }
-
-    if (path === '/api/graphql' && method === 'POST') {
-      await handleGraphQL(req, res);
-      return;
-    }
-
-    if (path === '/mcp' && method === 'POST') {
-      await handleMcp(req, res);
-      return;
-    }
-
-    if (path.startsWith('/api/v3') && !authorised(req)) {
-      sendJson(res, 401, { message: 'Bad credentials' });
-      return;
-    }
-
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
-      return;
-    }
-
-    if (path.startsWith('/api/v3') && await handleIssueHotPath(req, res, path, method)) return;
-
-    if (path.startsWith('/api/v3') && await handleRest(req, res, path, method)) return;
-
-    sendJson(res, 404, { message: 'Not Found' });
+    return dispatchRequest(req, res, method);
   });
 }

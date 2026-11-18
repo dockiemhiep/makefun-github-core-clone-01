@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, hash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 export const ZERO_OID = '0'.repeat(40);
@@ -8,15 +8,26 @@ export interface GitObject { type: ObjectType; data: Buffer }
 const TYPE_CODE: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const CODE_TYPE: Record<number, ObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
+const smallObjectHashInput = Buffer.allocUnsafe(4096);
 
 export function hashObject(type: ObjectType, data: Uint8Array): string {
+  const header = `${type} ${data.length}\0`;
+  if (header.length + data.length <= smallObjectHashInput.length) {
+    // Hashing is synchronous, so small objects can share one scratch buffer.
+    smallObjectHashInput.write(header);
+    smallObjectHashInput.set(data, header.length);
+    return hash('sha1', smallObjectHashInput.subarray(0, header.length + data.length));
+  }
   const body = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-  return createHash('sha1').update(`${type} ${body.length}\0`).update(body).digest('hex');
+  return createHash('sha1').update(header).update(body).digest('hex');
 }
 
 export function pkt(payload: string | Buffer): Buffer {
   const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
   return Buffer.concat([Buffer.from((data.length + 4).toString(16).padStart(4, '0')), data]);
+}
+export function pktText(payload: string): string {
+  return (Buffer.byteLength(payload) + 4).toString(16).padStart(4, '0') + payload;
 }
 export const FLUSH = Buffer.from('0000');
 export const DELIM = Buffer.from('0001');
@@ -58,7 +69,7 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   header.write('PACK', 0, 4, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
-  const parts = [header];
+  const parts: Buffer[] = [header];
   for (const object of list) parts.push(objectHeader(object.type, object.data.length), deflateSync(object.data, { level: 1 }));
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -84,7 +95,7 @@ function readObjectHeader(buffer: Buffer, start: number): { type: ObjectType; si
 export function readPack(pack: Buffer): Map<string, GitObject> {
   if (pack.length < 32 || pack.subarray(0, 4).toString() !== 'PACK' || pack.readUInt32BE(4) !== 2) throw new Error('invalid pack');
   const trailer = pack.subarray(pack.length - 20);
-  const expected = createHash('sha1').update(pack.subarray(0, -20)).digest();
+  const expected = hash('sha1', pack.subarray(0, -20), 'buffer');
   if (!trailer.equals(expected)) throw new Error('bad pack checksum');
   const count = pack.readUInt32BE(8);
   const result = new Map<string, GitObject>();
@@ -95,6 +106,8 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
     const inflated = inflateSync(pack.subarray(header.next, -20), {
       info: true,
       maxOutputLength: Math.max(1, header.size),
+      // A small inflated object should not retain zlib's default 16 KiB output buffer.
+      chunkSize: Math.max(64, Math.min(16 * 1024, header.size + 1)),
     }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     if (inflated.buffer.length !== header.size || !inflated.engine.bytesWritten) throw new Error('bad pack object size');
     offset = header.next + inflated.engine.bytesWritten;
@@ -326,38 +339,36 @@ export class ForgeStore {
   }
 }
 
-export function v0Advertisement(repo: Repository, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+export function v0Advertisement(repo: Repository, service: 'git-upload-pack' | 'git-receive-pack'): string {
   const caps = service === 'git-receive-pack'
     ? 'report-status side-band-64k delete-refs ofs-delta agent=makefun-forge/1'
     : 'side-band-64k thin-pack ofs-delta shallow symref=HEAD:refs/heads/main agent=makefun-forge/1';
-  const rows: Buffer[] = [pkt(`# service=${service}\n`), FLUSH];
+  const rows = [pktText(`# service=${service}\n`), '0000'];
   const refs = [...repo.refs.entries()].sort(([a], [b]) => a.localeCompare(b));
   const main = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
   const advertised: Array<[string, string]> = main ? [['HEAD', main], ...refs] : refs;
-  if (advertised.length === 0) rows.push(pkt(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+  if (advertised.length === 0) rows.push(pktText(`${ZERO_OID} capabilities^{}\0${caps}\n`));
   else {
     advertised.forEach(([name, oid], index) => {
-      rows.push(pkt(`${oid} ${name}${index === 0 ? `\0${caps}` : ''}\n`));
+      rows.push(pktText(`${oid} ${name}${index === 0 ? `\0${caps}` : ''}\n`));
       if (name.startsWith('refs/tags/')) {
         const target = repo.objects.get(oid)?.type === 'tag' ? tagTarget(repo.objects.get(oid)!.data) : null;
-        if (target) rows.push(pkt(`${target} ${name}^{}\n`));
+        if (target) rows.push(pktText(`${target} ${name}^{}\n`));
       }
     });
   }
-  rows.push(FLUSH);
-  return Buffer.concat(rows);
+  rows.push('0000');
+  return rows.join('');
 }
 
-export function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pkt('version 2\n'),
-    pkt('agent=makefun-forge/1\n'),
-    pkt('ls-refs=unborn\n'),
-    pkt('fetch=shallow\n'),
-    pkt('object-format=sha1\n'),
-    FLUSH,
-  ]);
-}
+export const V2_ADVERTISEMENT = Buffer.concat([
+  pkt('version 2\n'),
+  pkt('agent=makefun-forge/1\n'),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow\n'),
+  pkt('object-format=sha1\n'),
+  FLUSH,
+]);
 
 export function sidebandPack(pack: Buffer): Buffer[] {
   const rows: Buffer[] = [];

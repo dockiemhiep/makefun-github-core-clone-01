@@ -150,3 +150,120 @@ The ceiling on v22.23.2 with keep-alive is the client's timer: read cannot go be
 and 50 points needs 690 ms. The kit does not state the grader's Node patch release, but the trial image
 its CLI pins (`node@sha256:de170b39439e...`, referenced in `cli/makefun.mjs`) is `v22.23.4` with undici
 `6.29.1`, the same runtime as the Linux measurements above.
+
+## Perf Round 2 — priced implementation (2026-11-18)
+
+Implemented independently from `0922ab3` on `perf/round2-priced`. Only the baseline and the three
+requested background records were used; no excluded branch, commit, or debate record was read.
+Nothing was submitted or pushed.
+
+### Method and baseline
+
+One official Docker baseline and five fresh SDK runs completed before the first code edit. The
+initial five official grades of the pinned `0922ab3` baseline all passed Feature 600 / Agent 200 /
+Perf 200, with median `perf_p50_us` **70,852**. Their median workload p50s were push **107.896 ms**,
+clone **36.153 ms**, read **203.418 ms**, write **30.412 ms**. This session's machine was substantially
+faster than the earlier build record; the earlier 104,947 us is not used as the comparison baseline.
+
+All final comparisons below use five fresh entry processes per version, alternating baseline and
+candidate. Each workload still uses the SDK's five warm-ups and three measured rounds. Reported
+columns are medians across the five runs; the aggregate is the median of the five `perf_p50_us`
+values, not the geometric mean of the column medians.
+
+- Official: unchanged kit CLI, `grade-local --driver docker --kit . --bot <repo>` with `--commit
+  0922ab3` for baseline and `--worktree` for the candidate. `TMPDIR=$HOME/makefun-grade-tmp/` was
+  exported for every invocation. Entry/env image digest remains `de170b39439e...`, Node 22.23.4 /
+  undici 6.29.1. The CLI reports its existing harness Node 26.9.0 vs server 26.13.1 mismatch for both
+  versions; the entry/env runtime is the pinned Node 22 image in both.
+- SDK: unmodified `sdk/run.ts --perf --json` in `node:22-alpine`, Node 22.23.4 / undici 6.29.1,
+  arm64, `--cpus 2 -m 1024m`; entry starts via `main.ts` with a stub coordinator. The entry and SDK
+  share this container's limits, matching the earlier NOTES protocol.
+- Host `uptime` was recorded before each alternating measurement; no run started above load 6.
+  Noise remained visible below that threshold. Separate phase profiles use 25 rounds to collect
+  samples; they are diagnostics, not replacements for the three-round grader measurements.
+- Runner scripts, complete round arrays, JSON scores, replay exports, and CPU profiles are retained
+  outside the repository at `$HOME/makefun-grade-tmp/round2-priced/`. The final prefixes are
+  `official-validated-{base,candidate}-*` and `validated{base,}-pair*`.
+
+| Method / version (5 runs each) | push p50 ms | clone p50 ms | read p50 ms | write p50 ms | perf_p50_us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Official alternating baseline | 107.064 | 37.977 | 192.544 | 32.412 | 71,059 |
+| Official final candidate | 104.019 | 39.643 | 188.918 | 31.281 | 68,410 |
+| Linux SDK alternating baseline | 103.137 | 38.106 | 188.852 | 32.147 | 70,522 |
+| Linux SDK final candidate | 98.497 | 34.986 | 182.199 | 27.821 | 64,542 |
+
+Official final median: **71,059 -> 68,410 us (3.73% lower)** in the
+interleaved comparison; 3.45% lower than the pre-edit baseline. The SDK
+paired comparison improved 8.48%. The requested >=10% official improvement
+was **not demonstrated**. All timing runs are retained, including outliers; none is discarded to
+reach the target. In particular, final official candidate aggregates were 62994, 68410, 71299, 66134, 82560 us.
+
+### Profile findings and retained changes
+
+V8 inspector profiles sampled the Linux entry at 100 us during each isolated workload. Baseline
+push was dominated by socket writes, GC, pack inflation, and body handling. Clone's remaining
+application work was advertisements, ls-refs, and packet decoding. Issue reads still parsed URLs
+and resolved repositories; writes added the async-iterator body lifecycle. Commit parsing was too
+small to justify a metadata-cache refactor.
+
+The staged SDK comparisons below each used five fresh full suites. They identify affected-workload
+medians, not additive percentage guarantees:
+
+| Change | Before -> after | Evidence / behavior |
+| --- | --- | --- |
+| Cache issue JSON as UTF-8 strings | read 188.641 -> 176.085 ms; write 30.730 -> 28.233 ms | node:http combines the header and string body; JSON bytes are unchanged |
+| Cache exact issue request target + method | read 188.237 -> 179.012 ms | bounded 256 entries; every hit checks exact auth, live repository identity/owner, and Git generation; issue state is checked on every serialization-cache hit |
+| Reuse issue response header arrays and byte length | read 189.162 -> 184.919 ms; write 31.237 -> 30.062 ms | avoids recreating header objects and rescanning UTF-8 text on each read |
+| Right-size zlib output slabs for small objects | push 110.703 -> 104.652 ms | chunk size 64..16,384 bytes; checksum, output ceiling, object-size checks, storage, and ancestry checks remain intact |
+| Reuse validated receive-pack success framing | isolated 25-round push entry CPU 842.4 -> 802.6 ms | bounded 256 refs; cache is consulted only after full pack ingestion and per-ref validation; mixed/rejected reports remain generated normally |
+| Event-based, zero-copy body collection | write 31.062 -> 25.461 ms; SDK aggregate 66,130 -> 63,375 us | retains the 64 MiB cap and concatenates only multi-chunk bodies |
+| Exact-byte upload-pack answer cache plus immutable v2 advertisement | clone 33.217 -> 31.614 ms; SDK aggregate 61,712 -> 60,291 us | caches both ls-refs and fetch, keyed by complete request bytes; repository generation, object count, and default branch invalidate it |
+
+The upload cache retains the original 16-answer / 4 MiB-per-answer bounds and now limits cached
+request keys to 64 KiB; larger requests still execute normally. Repository identity is a WeakMap
+key, so deletion/recreation cannot reuse an old answer. Rejected pushes that ingest objects without
+moving refs still invalidate by object count. The single-ref success report contains no repository
+state and cannot bypass validation.
+
+As a diagnostic across 25-round phases, entry user+system CPU fell from 1,026.7 -> 761.5 ms (push),
+425.9 -> 369.2 ms (clone), 1,404.3 -> 1,241.9 ms (read), and 480.5 -> 386.2 ms (write). Push GC samples
+fell from 116.6 -> 42.8 ms in the earlier allocation comparison. Profiles include setup and profiler
+overhead and are not official timing claims. The final overflow repair only changes the reject path.
+
+### Experiments rejected and correctness repair
+
+- Removing only the Buffer copy did not pay: SDK aggregate 63,547 -> 65,157 us. It was reverted as a
+  standalone change; zero-copy was retained only with the measured event-reader improvement.
+- The initial advertisement/upload-cache combination did not pay with the original body reader
+  (65,157 -> 66,532 us). It was reverted, then retained only after the later combined retest above.
+- Small binary responses converted to latin1 strings (65,920 -> 66,604 us), a broad parsed-URL cache
+  (66,604 -> 67,346 us), and splitting synchronous/async dispatch (63,375 -> 67,846 us) were reverted.
+- No v0 advertisement cache was added: the push profile's advertisement cost was small and every
+  successful push changes its generation. No parsed-commit cache or HTTP-stack replacement was kept.
+- The first event reader called `req.destroy()` on overflow. A boundary comparison caught a socket
+  reset where baseline answered JSON 400. Node's async iterator detaches the request socket before
+  destroying its stream; the replacement now rejects and drains excess input with `req.resume()`.
+  The 64 MiB limit is unchanged. A committed regression test accepts exactly 64 MiB, rejects 64 MiB
+  + 1 with the exact JSON 400 body, and verifies the rejected request did not create an issue and
+  subsequent requests still succeed. The same test failed with ECONNRESET against the unfixed
+  candidate and passed against the repair.
+
+### Verification
+
+- Final SDK five-run pairs: 120/120 conformance and 15/15 MCP on every run, SDK/client EXIT=0 and
+  measurement-driver EXIT=0. All scored workload operations completed, with Perf 200 throughout.
+- Official five-run final pairs: Feature 600 / Agent 200 / Perf 200, score 1,000, EXIT=0 on every run. Live/replay exports match and L1 reproduces in every run.
+- Independent HTTP differential probes: 330 comparisons passed, including UTF-8 response bytes,
+  exact-token rejection after cache warm-up, REST/GraphQL state changes, MCP parity, cross-owner
+  requests, malformed JSON/URLs, cache eviction, delete/recreate, split and aborted uploads, bad pack
+  checksum/size/trailing bytes, mixed and stale ref reports, and shallow fetch/deepen requests.
+  Boundary differential tests use two entries in a 2 GiB test container; scored runs use the 1 GiB
+  configuration above. Both baseline and candidate answered JSON 400 at the invalid-JSON 64 MiB
+  boundary and at 64 MiB + 1.
+- `npm test` on Linux Node 22: EXIT=0. Regression sensitivity against the unfixed candidate: EXIT=1
+  for the intended ECONNRESET failure. The positive limit/control requests pass.
+- Node syntax checks and `git diff --check`: EXIT=0. Scoped secret-pattern / dangerous-API checks
+  passed; runtime dependencies remain empty. Exact bearer-token comparison is unchanged.
+- No lint/typecheck script or local tsc exists. gitleaks, trufflehog, semgrep, and osv-scanner were
+  unavailable; no comprehensive scanner pass or live-grader performance result is claimed.
+- All measurement/probe containers are task-owned and auto-removed. No dev server is left running.

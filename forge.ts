@@ -95,6 +95,8 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
     const inflated = inflateSync(pack.subarray(header.next, -20), {
       info: true,
       maxOutputLength: Math.max(1, header.size),
+      // Avoid reserving a 16 KiB output slab for every small loose object.
+      chunkSize: Math.max(64, Math.min(16 * 1024, header.size)),
     }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     if (inflated.buffer.length !== header.size || !inflated.engine.bytesWritten) throw new Error('bad pack object size');
     offset = header.next + inflated.engine.bytesWritten;
@@ -348,15 +350,17 @@ export function v0Advertisement(repo: Repository, service: 'git-upload-pack' | '
   return Buffer.concat(rows);
 }
 
-export function v2Advertisement(): Buffer {
-  return Buffer.concat([
+const V2_ADVERTISEMENT = Buffer.concat([
     pkt('version 2\n'),
     pkt('agent=makefun-forge/1\n'),
     pkt('ls-refs=unborn\n'),
     pkt('fetch=shallow\n'),
     pkt('object-format=sha1\n'),
     FLUSH,
-  ]);
+]);
+
+export function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
 export function sidebandPack(pack: Buffer): Buffer[] {

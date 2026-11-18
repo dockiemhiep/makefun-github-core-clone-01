@@ -267,3 +267,65 @@ overhead and are not official timing claims. The final overflow repair only chan
 - No lint/typecheck script or local tsc exists. gitleaks, trufflehog, semgrep, and osv-scanner were
   unavailable; no comprehensive scanner pass or live-grader performance result is claimed.
 - All measurement/probe containers are task-owned and auto-removed. No dev server is left running.
+
+### Review fix — deleted-repository retention (2026-11-18)
+
+On successful repository deletion, the bounded issue-route map is now cleared so its cached
+routes release the deleted Repository and its issues. The upload-response cache (`fetchCache`)
+uses a `WeakMap<Repository, ...>`: its keys do not strongly retain repositories, so it needs no
+explicit deletion eviction. The issue-body cache also uses weak keys. The optional body-limit
+test improvement now asserts `req.reusedSocket` on the request following overflow.
+
+Fresh processes in the pinned Docker image `de170b39439e...` (Node **22.23.4**, 2 CPUs,
+1,024 MiB) drove create repo, POST issue, GET issue, DELETE repo (204), GET issue (404), then GC.
+`v8.queryObjects(Repository, { format: 'count' })` measured:
+
+| Version | Before creation | After issue POST and GET | After DELETE, GET and GC |
+| --- | ---: | ---: | ---: |
+| `4015f66` | 0 | 1 | 1 |
+| Retention fix | 0 | 1 | 0 |
+
+The same assertion fails against the archived `4015f66` for the intended retention defect
+(EXIT=1) and passes after the fix (EXIT=0). A separate fresh process warmed upload-pack ls-refs
+answers twice with old contents and an old-only branch before deletion; it also measured zero
+live repositories after deletion and GC. Both probes passed same-name recreation checks. The
+extended probe verified empty replacement issues/refs, new issue numbering and title, missing old
+contents, and upload answers containing only the replacement's refs. Deleting the replacement
+returned the instance count to zero again. Peak memory was not measured.
+
+Five official Docker pairs compared the `4015f66` committed snapshot against the fixed worktree,
+alternating pair order (base/fix, fix/base). Every invocation ran from the kit directory after
+`export TMPDIR=$HOME/makefun-grade-tmp/`, using unchanged
+`node cli/makefun.mjs grade-local --driver docker --kit . --bot <repo> --json --save <evidence>`
+with `--commit 4015f66` or `--worktree`. `uptime` was recorded before every timing run; starting
+one-minute load ranged from **2.04 to 3.18** on the shared Mac. The entry/env image remained pinned
+to Node 22.23.4; the CLI's existing harness-version mismatch remains as described above.
+
+| Pair | Order | `4015f66` perf_p50_us | Fixed perf_p50_us | Fixed time change |
+| --- | --- | ---: | ---: | ---: |
+| 1 | Base, fix | 76,371 | 69,624 | -8.83% |
+| 2 | Fix, base | 66,310 | 61,997 | -6.50% |
+| 3 | Base, fix | 66,536 | 62,024 | -6.78% |
+| 4 | Fix, base | 64,117 | 66,334 | +3.46% |
+| 5 | Base, fix | 64,830 | 67,704 | +4.43% |
+
+All ten invocations scored **1,000/1,000: Feature 600 / Agent 200 / Perf 200**, EXIT=0,
+with 120/120 checks including MCP 15/15, matching live/replay state, L1 reproduced, and zero
+nondeterministic trials. The geometric mean of paired fixed/base timing ratios was **0.969941**
+(**3.01% lower**). Separate medians were **66,310 -> 66,334 us (+0.04%)**. The measurements show
+no aggregate regression beyond observed shared-host noise; no timed-workload speedup is attributed
+to the deletion fix.
+
+Additional fixed-tree gates on the same pinned Node image:
+
+- Fresh SDK full run through `main.ts`: **120/120**, MCP **15/15**, Feature 600 / Agent 200 /
+  Perf 200, SDK and driver EXIT=0.
+- `npm test`: EXIT=0, including the new follow-up socket-reuse assertion.
+- `node --check` for all three runtime files and `test/body-limit.test.mjs`: EXIT=0.
+- `git diff --check`: EXIT=0. No lint/typecheck script or installed compiler is available;
+  no supplemental typecheck was run.
+
+Probe scripts, archived pre-fix source, exact runtime diff, SDK output, all ten official JSON/state
+exports, timing summary and load logs are retained outside the repository at
+`$HOME/makefun-grade-tmp/round2-priced-fix/`. Test servers exited, task containers were auto-removed,
+and nothing was submitted or pushed.

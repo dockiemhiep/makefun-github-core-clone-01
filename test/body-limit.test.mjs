@@ -19,7 +19,7 @@ test('accept the body limit, reject overflow with JSON, and keep serving', { tim
     }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString() }));
+      res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString(), reusedSocket: req.reusedSocket }));
       res.on('error', reject);
     });
     req.on('error', reject);
@@ -42,6 +42,7 @@ test('accept the body limit, reject overflow with JSON, and keep serving', { tim
     assert.equal(rejected.text, '{"message":"Problems parsing JSON"}\n');
 
     const control = await post(path, { title: 'after overflow' });
+    assert.equal(control.reusedSocket, true);
     assert.equal(control.status, 201);
     assert.equal(JSON.parse(control.text).number, 2);
     assert.equal(JSON.parse(control.text).title, 'after overflow');

@@ -754,7 +754,11 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         const body = await jsonBody(req);
         if (typeof body.description === 'string') repo.description = body.description;
         sendJson(res, 200, repoJson(repo));
-      } else if (method === 'DELETE') { store.repos.delete(repo.name); sendEmpty(res, 204); }
+      } else if (method === 'DELETE') {
+        store.repos.delete(repo.name);
+        issueRoutes.clear();
+        sendEmpty(res, 204);
+      }
       else return false;
       return true;
     }

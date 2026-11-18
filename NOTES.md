@@ -157,22 +157,26 @@ Baseline `0922ab3`. The official Docker grader used its pinned Node `v22.23.4` i
 `TMPDIR=$HOME/makefun-grade-tmp/`. The SDK used `sdk/run.ts --perf --json`, a fresh entry process
 through `main.ts`, and one `node:22-alpine` container with Node `v22.23.4`, undici `6.29.1`, two CPUs,
 and 1,024 MiB. Each timing was checked against host load before launch. Baseline and candidate
-order alternated in the final five pairs. Each column is the median of the corresponding per-run
+order alternated in the five-run comparison batches. The committed Docker comparison pinned
+`0922ab3` and `39f1f5e` with `--commit`. Each column is the median of the corresponding per-run
 value. The aggregate is the median of the reported `perf_p50_us` values.
 
 | Gate | Source | Runs | Push (ms) | Clone (ms) | Read (ms) | Write (ms) | `perf_p50_us` |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Official Docker | Initial baseline | 3 | 156.957 | 59.468 | 254.003 | 45.614 | 102,553 |
-| Official Docker | Paired baseline | 5 | 161.532 | 61.913 | 264.459 | 42.354 | 102,295 |
-| Official Docker | Final implementation | 5 | 141.849 | 60.027 | 257.682 | 38.565 | 97,283 |
+| Official Docker, worktree comparison | Paired baseline | 5 | 161.532 | 61.913 | 264.459 | 42.354 | 102,295 |
+| Official Docker, worktree comparison | Final implementation | 5 | 141.849 | 60.027 | 257.682 | 38.565 | 97,283 |
+| Official Docker, committed SHAs | Paired baseline | 5 | 166.901 | 60.922 | 257.744 | 45.023 | 107,194 |
+| Official Docker, committed SHAs | Final implementation | 5 | 139.765 | 59.657 | 234.686 | 40.210 | 93,342 |
 | Linux SDK | Initial baseline | 5 | 167.426 | 61.659 | 262.168 | 39.423 | 104,437 |
 | Linux SDK | Paired baseline | 5 | 167.044 | 60.646 | 281.365 | 37.062 | 101,833 |
 | Linux SDK | Final implementation | 5 | 147.009 | 61.368 | 270.425 | 34.707 | 95,227 |
 
 All final comparison runs scored Feature 600, Agent 200, and Perf 200. Official live and replay
-state exports matched. The paired aggregate fell 4.9% in the official grader and 6.5% in the SDK.
-The official median fell short of the 10% target. The SDK clone median moved 1.2% higher in the
-final comparison despite the isolated cache win.
+state exports matched. The paired aggregate fell 12.9% with the committed SHAs, 4.9% in the earlier
+worktree comparison, and 6.5% in the SDK. The committed result was 9.0% below the initial official
+baseline. The SDK clone median moved 1.2% higher in the final comparison despite the isolated cache
+win.
 
 ### Profile and changes
 

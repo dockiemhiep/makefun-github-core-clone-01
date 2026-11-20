@@ -1,4 +1,13 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage } from 'node:http';
+import {
+  bytesWire,
+  createHybridServer,
+  jsonWire,
+  type BufferedRequest,
+  type HttpResponse,
+  type HybridServer,
+} from './raw-http.ts';
+
 import {
   DELIM,
   FLUSH,
@@ -23,32 +32,50 @@ import {
   type Repository,
 } from './forge.ts';
 
+type Request = IncomingMessage | BufferedRequest;
+
 const JSON_TYPE = 'application/json; charset=utf-8';
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const BEARER = `Bearer ${TOKEN}`;
 const store = new ForgeStore();
-const issueBodyCache = new WeakMap<IssueRecord, { state: IssueRecord['state']; body: string; headers: string[] }>();
+interface IssueBody {
+  state: IssueRecord['state'];
+  body: string;
+  headers: string[];
+  wire?: Buffer;
+}
+const issueBodyCache = new WeakMap<IssueRecord, IssueBody>();
 const ISSUE_ROUTE_CACHE_LIMIT = 256;
 interface IssueRoute { repo: Repository; generation: number; issue?: IssueRecord }
-const issueRoutes = new Map<string, IssueRoute>();
+const getIssueRoutes = new Map<string, IssueRoute>();
+const postIssueRoutes = new Map<string, IssueRoute>();
 
-function rememberIssueRoute(req: IncomingMessage, repo: Repository, issue?: IssueRecord): void {
-  if (issueRoutes.size >= ISSUE_ROUTE_CACHE_LIMIT) issueRoutes.clear();
-  issueRoutes.set(`${req.method}\0${req.url}`, { repo, generation: repo.generation, issue });
+function rememberIssueRoute(req: Request, repo: Repository, issue?: IssueRecord): void {
+  const routes = issue ? getIssueRoutes : postIssueRoutes;
+  if (routes.size >= ISSUE_ROUTE_CACHE_LIMIT) routes.clear();
+  routes.set(req.url ?? '/', { repo, generation: repo.generation, issue });
 }
 
-function sendJsonText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
+function liveIssueRoute(method: string, target: string): IssueRoute | undefined {
+  const route = method === 'GET' ? getIssueRoutes.get(target)
+    : method === 'POST' ? postIssueRoutes.get(target) : undefined;
+  if (route && route.repo.generation === route.generation &&
+      store.repos.get(route.repo.name) === route.repo && route.repo.owner === store.viewer) return route;
+}
+
+function sendJsonText(res: HttpResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
   res.sendDate = false;
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': 'MF-FORGE', ...headers });
   res.end(text);
 }
 
 /** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+function sendJson(res: HttpResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
   sendJsonText(res, status, text, headers);
 }
 
-function sendBytes(res: ServerResponse, status: number, body: Buffer, type: string): void {
+function sendBytes(res: HttpResponse, status: number, body: Buffer, type: string): void {
   res.sendDate = false;
   res.writeHead(status, { 'content-type': type, 'content-length': body.length });
   res.end(body);
@@ -62,7 +89,8 @@ function requestUrl(target: string): URL | null {
   }
 }
 
-function readBody(req: IncomingMessage, limit = 64 * 1024 * 1024): Promise<Buffer> {
+function readBody(req: Request, limit = 64 * 1024 * 1024): Promise<Buffer> {
+  if ('body' in req) return Promise.resolve(req.body);
   return new Promise((resolve, reject) => {
     let first: Buffer | undefined;
     let chunks: Buffer[] | undefined;
@@ -99,8 +127,8 @@ function readBody(req: IncomingMessage, limit = 64 * 1024 * 1024): Promise<Buffe
   });
 }
 
-function authorised(req: IncomingMessage): boolean {
-  return TOKEN !== '' && req.headers.authorization === `Bearer ${TOKEN}`;
+function authorised(req: Request): boolean {
+  return TOKEN !== '' && req.headers.authorization === BEARER;
 }
 
 function repoJson(repo: Repository): Record<string, unknown> {
@@ -115,17 +143,20 @@ function repoJson(repo: Repository): Record<string, unknown> {
   };
 }
 
-function sendEmpty(res: ServerResponse, status: number): void {
+function sendEmpty(res: HttpResponse, status: number): void {
   res.sendDate = false;
   res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': '0', 'x-github-request-id': 'MF-FORGE' });
   res.end();
 }
 
-async function jsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const raw = await readBody(req);
+function parseJsonBody(raw: Buffer): Record<string, unknown> {
   const value = JSON.parse(raw.length ? raw.toString('utf8') : '{}');
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('JSON object required');
   return value as Record<string, unknown>;
+}
+
+async function jsonBody(req: Request): Promise<Record<string, unknown>> {
+  return parseJsonBody(await readBody(req));
 }
 
 function issueJson(issue: IssueRecord): Record<string, unknown> {
@@ -139,14 +170,24 @@ function issueJson(issue: IssueRecord): Record<string, unknown> {
   };
 }
 
-function sendIssue(res: ServerResponse, status: number, issue: IssueRecord): void {
+function issueText(issue: IssueRecord): string {
+  if (issue.labels.length !== 0) return `${JSON.stringify(issueJson(issue))}\n`;
+  return `{"id":${issue.id},"number":${issue.number},"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},"state":"${issue.state}","labels":[]}\n`;
+}
+
+function issueBody(issue: IssueRecord): IssueBody {
   let cached = issueBodyCache.get(issue);
   if (cached?.state !== issue.state) {
-    const body = `${JSON.stringify(issueJson(issue))}\n`;
+    const body = issueText(issue);
     const headers = ['content-type', JSON_TYPE, 'content-length', String(Buffer.byteLength(body)), 'x-github-request-id', 'MF-FORGE'];
     cached = { state: issue.state, body, headers };
     issueBodyCache.set(issue, cached);
   }
+  return cached;
+}
+
+function sendIssue(res: HttpResponse, status: number, issue: IssueRecord): void {
+  const cached = issueBody(issue);
   res.sendDate = false;
   res.writeHead(status, cached.headers);
   res.end(cached.body);
@@ -400,7 +441,7 @@ function executeGraphQL(operation: Record<string, unknown>): Record<string, unkn
   return { errors: [{ message: 'Unknown operation' }] };
 }
 
-async function handleGraphQL(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleGraphQL(req: Request, res: HttpResponse): Promise<void> {
   if (!authorised(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
   try {
     const parsed = JSON.parse((await readBody(req)).toString('utf8')) as unknown;
@@ -480,7 +521,7 @@ function callMcpTool(name: string, args: Record<string, unknown>): { result?: un
   return { error: { code: -32601, message: 'Unknown tool' } };
 }
 
-async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handleMcp(req: Request, res: HttpResponse): Promise<void> {
   if (!authorised(req)) { sendJson(res, 401, { message: 'Bad credentials' }); return; }
   let request: Record<string, unknown>;
   try {
@@ -515,7 +556,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
   sendJson(res, 200, rpc(id, undefined, { code: -32601, message: 'Method not found' }));
 }
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, path: string, method: string): Promise<boolean> {
+async function handleRest(req: Request, res: HttpResponse, path: string, method: string): Promise<boolean> {
   const url = new URL(req.url ?? '/', 'http://entry');
   try {
     if (method === 'GET' && path === '/api/v3/meta') {
@@ -755,7 +796,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         sendJson(res, 200, repoJson(repo));
       } else if (method === 'DELETE') {
         store.repos.delete(repo.name);
-        issueRoutes.clear();
+        getIssueRoutes.clear();
+        postIssueRoutes.clear();
         sendEmpty(res, 204);
       }
       else return false;
@@ -769,7 +811,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
 }
 
 /** Fast dispatch for ordinary single-issue reads and issue creation. */
-async function handleIssueHotPath(req: IncomingMessage, res: ServerResponse, path: string, method: string): Promise<boolean> {
+async function handleIssueHotPath(req: Request, res: HttpResponse, path: string, method: string): Promise<boolean> {
   try {
     if (method === 'GET') {
       const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(path);
@@ -837,7 +879,13 @@ function gitContentType(service: string, kind: 'advertisement' | 'result'): stri
   return `application/x-${service}-${kind}`;
 }
 
-function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repository, service: 'git-upload-pack' | 'git-receive-pack'): void {
+const UPLOAD_ADVERTISEMENT_TYPE = gitContentType('git-upload-pack', 'advertisement');
+const RECEIVE_ADVERTISEMENT_TYPE = gitContentType('git-receive-pack', 'advertisement');
+const UPLOAD_RESULT_TYPE = gitContentType('git-upload-pack', 'result');
+const RECEIVE_RESULT_TYPE = gitContentType('git-receive-pack', 'result');
+const V2_ADVERTISEMENT_WIRE = bytesWire(200, v2Advertisement(), UPLOAD_ADVERTISEMENT_TYPE);
+
+function handleInfoRefs(req: Request, res: HttpResponse, repo: Repository, service: 'git-upload-pack' | 'git-receive-pack'): void {
   const wantsV2 = service === 'git-upload-pack' && String(req.headers['git-protocol'] ?? '').includes('version=2');
   const body = wantsV2 ? v2Advertisement() : v0Advertisement(repo, service);
   sendBytes(res, 200, body, gitContentType(service, 'advertisement'));
@@ -901,13 +949,14 @@ function fetchResponse(repo: Repository, lines: Buffer[]): Buffer {
 const FETCH_CACHE_ENTRIES = 16;
 const FETCH_CACHE_MAX_REQUEST_BYTES = 64 * 1024;
 const FETCH_CACHE_MAX_BYTES = 4 * 1024 * 1024;
-const fetchCache = new WeakMap<Repository, { generation: number; objects: number; branch: string; answers: Map<string, Buffer> }>();
+interface FetchAnswer { body: Buffer; wire?: Buffer }
+const fetchCache = new WeakMap<Repository, { generation: number; objects: number; branch: string; answers: Map<string, FetchAnswer> }>();
 
 /**
  * Both v2 commands depend only on the exact request and this repository's refs and objects.
  * Decode and validate a request on a miss; a hit reuses the complete, already framed answer.
  */
-function cachedUploadResponse(repo: Repository, body: Buffer): Buffer {
+function cachedUploadResponse(repo: Repository, body: Buffer): FetchAnswer {
   let entry = fetchCache.get(repo);
   if (!entry || entry.generation !== repo.generation || entry.objects !== repo.objects.size || entry.branch !== repo.defaultBranch) {
     entry = { generation: repo.generation, objects: repo.objects.size, branch: repo.defaultBranch, answers: new Map() };
@@ -919,22 +968,25 @@ function cachedUploadResponse(repo: Repository, body: Buffer): Buffer {
   const decoded = decodeUntilFlush(body);
   const first = decoded.lines[0]?.toString().trim() ?? '';
   const args = decoded.rest.length ? decodeUntilFlush(decoded.rest).lines : decoded.lines;
-  let answer: Buffer;
-  if (first === 'command=ls-refs') answer = lsRefsResponse(repo, args);
-  else if (first === 'command=fetch') answer = fetchResponse(repo, args);
+  let data: Buffer;
+  if (first === 'command=ls-refs') data = lsRefsResponse(repo, args);
+  else if (first === 'command=fetch') data = fetchResponse(repo, args);
   else throw new Error('invalid upload-pack request');
-  if (key !== null && answer.length <= FETCH_CACHE_MAX_BYTES) {
+  const answer: FetchAnswer = { body: data };
+  if (key !== null && data.length <= FETCH_CACHE_MAX_BYTES) {
     if (entry.answers.size >= FETCH_CACHE_ENTRIES) entry.answers.clear();
     entry.answers.set(key, answer);
   }
   return answer;
 }
 
-async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repository): Promise<void> {
+const INVALID_UPLOAD_REQUEST = Buffer.from('invalid upload-pack request');
+
+async function handleUploadPack(req: Request, res: HttpResponse, repo: Repository): Promise<void> {
   try {
-    sendBytes(res, 200, cachedUploadResponse(repo, await readBody(req)), gitContentType('git-upload-pack', 'result'));
+    sendBytes(res, 200, cachedUploadResponse(repo, await readBody(req)).body, UPLOAD_RESULT_TYPE);
   } catch {
-    sendBytes(res, 400, Buffer.from('invalid upload-pack request'), 'text/plain');
+    sendBytes(res, 400, INVALID_UPLOAD_REQUEST, 'text/plain');
   }
 }
 
@@ -962,125 +1014,199 @@ function receiveReport(reports: Array<{ ref: string; ok: boolean; reason?: strin
   return body;
 }
 
-async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo: Repository): Promise<void> {
+function receivePackResponse(repo: Repository, body: Buffer): Buffer {
+  const decoded = decodeUntilFlush(body);
+  if (decoded.rest.length) {
+    for (const [oid, object] of readPack(decoded.rest)) repo.objects.set(oid, object);
+  }
+  const reports: Array<{ ref: string; ok: boolean; reason?: string }> = [];
+  for (let index = 0; index < decoded.lines.length; index += 1) {
+    const line = decoded.lines[index].toString('utf8').replace(/\n$/, '').split('\0')[0];
+    const [oldOid, newOid, ref] = line.split(' ');
+    const current = repo.refs.get(ref) ?? ZERO_OID;
+    let reason = '';
+    if (current !== oldOid) reason = 'stale-info';
+    else if (newOid !== ZERO_OID && !repo.objects.has(newOid)) reason = 'missing-object';
+    else if (oldOid !== ZERO_OID && newOid !== ZERO_OID && ref.startsWith('refs/heads/') && !repo.isAncestor(oldOid, newOid)) reason = 'non-fast-forward';
+    if (reason) reports.push({ ref, ok: false, reason });
+    else {
+      if (newOid === ZERO_OID) repo.refs.delete(ref);
+      else repo.refs.set(ref, newOid);
+      repo.generation += 1;
+      reports.push({ ref, ok: true });
+    }
+  }
+  return receiveReport(reports);
+}
+
+async function handleReceivePack(req: Request, res: HttpResponse, repo: Repository): Promise<void> {
   try {
-    const decoded = decodeUntilFlush(await readBody(req));
-    if (decoded.rest.length) {
-      for (const [oid, object] of readPack(decoded.rest)) repo.objects.set(oid, object);
-    }
-    const reports: Array<{ ref: string; ok: boolean; reason?: string }> = [];
-    for (let index = 0; index < decoded.lines.length; index += 1) {
-      const line = decoded.lines[index].toString('utf8').replace(/\n$/, '').split('\0')[0];
-      const [oldOid, newOid, ref] = line.split(' ');
-      const current = repo.refs.get(ref) ?? ZERO_OID;
-      let reason = '';
-      if (current !== oldOid) reason = 'stale-info';
-      else if (newOid !== ZERO_OID && !repo.objects.has(newOid)) reason = 'missing-object';
-      else if (oldOid !== ZERO_OID && newOid !== ZERO_OID && ref.startsWith('refs/heads/') && !repo.isAncestor(oldOid, newOid)) reason = 'non-fast-forward';
-      if (reason) reports.push({ ref, ok: false, reason });
-      else {
-        if (newOid === ZERO_OID) repo.refs.delete(ref);
-        else repo.refs.set(ref, newOid);
-        repo.generation += 1;
-        reports.push({ ref, ok: true });
-      }
-    }
-    sendBytes(res, 200, receiveReport(reports), gitContentType('git-receive-pack', 'result'));
+    sendBytes(res, 200, receivePackResponse(repo, await readBody(req)), RECEIVE_RESULT_TYPE);
   } catch {
-    sendBytes(res, 200, RECEIVE_ERROR, gitContentType('git-receive-pack', 'result'));
+    sendBytes(res, 200, RECEIVE_ERROR, RECEIVE_RESULT_TYPE);
   }
 }
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const method = req.method ?? 'GET';
-    const route = issueRoutes.get(`${method}\0${req.url}`);
-    // Resolve only authenticated, still-live repositories. The issue record is live too:
-    // sendIssue checks its mutable state before reusing serialized bytes.
-    if (route && authorised(req) && route.repo.generation === route.generation &&
-        store.repos.get(route.repo.name) === route.repo && route.repo.owner === store.viewer) {
-      if (method === 'GET' && route.issue) {
-        sendIssue(res, 200, route.issue);
-        return;
-      }
-      if (method === 'POST') {
-        try {
-          const issue = createIssue(route.repo, await jsonBody(req));
-          if (!issue) sendJson(res, 422, { message: 'Validation Failed: label does not exist' });
-          else sendIssue(res, 201, issue);
-        } catch {
-          sendJson(res, 400, { message: 'Problems parsing JSON' });
-        }
-        return;
+const BAD_CREDENTIALS_WIRE = jsonWire(401, '{"message":"Bad credentials"}\n');
+const NOT_FOUND_WIRE = jsonWire(404, '{"message":"Not Found"}\n');
+const INVALID_JSON_WIRE = jsonWire(400, '{"message":"Problems parsing JSON"}\n');
+const UNKNOWN_LABEL_WIRE = jsonWire(422, '{"message":"Validation Failed: label does not exist"}\n');
+const INVALID_UPLOAD_WIRE = bytesWire(400, INVALID_UPLOAD_REQUEST, 'text/plain');
+const RECEIVE_ERROR_WIRE = bytesWire(200, RECEIVE_ERROR, RECEIVE_RESULT_TYPE);
+
+function uploadWire(repo: Repository, body: Buffer): Buffer {
+  const answer = cachedUploadResponse(repo, body);
+  if (!answer.wire) {
+    answer.wire = bytesWire(200, answer.body, UPLOAD_RESULT_TYPE);
+    // The HTTP fallback can send just the body from the same allocation.
+    answer.body = answer.wire.subarray(answer.wire.length - answer.body.length);
+  }
+  return answer.wire;
+}
+
+function dispatchHot(method: string, target: string, authorized: boolean, gitV2: boolean,
+  input: Buffer, start: number, end: number): Buffer | undefined {
+  const route = authorized ? liveIssueRoute(method, target) : undefined;
+  if (route) {
+    if (method === 'GET' && route.issue) {
+      const body = issueBody(route.issue);
+      if (body.wire) return body.wire;
+      const wire = jsonWire(200, body.body);
+      if (wire.length <= FETCH_CACHE_MAX_BYTES) body.wire = wire;
+      return wire;
+    }
+    if (method === 'POST') {
+      try {
+        const issue = createIssue(route.repo, parseJsonBody(input.subarray(start, end)));
+        return issue ? jsonWire(201, issueText(issue)) : UNKNOWN_LABEL_WIRE;
+      } catch {
+        return INVALID_JSON_WIRE;
       }
     }
-    const target = req.url ?? '/';
-    const cachedGit = gitRoutes.get(target);
-    const url = cachedGit ? null : requestUrl(target);
-    const path = cachedGit?.path ?? url?.pathname ?? '/';
+  }
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
-    if (method === 'GET' && path === '/healthz') {
-      sendJson(res, 200, { ok: true });
+  const git = gitRoutes.get(target);
+  if (!git) return undefined;
+  if (!authorized) return BAD_CREDENTIALS_WIRE;
+  const repo = store.get(git.owner, git.name);
+  if (!repo) return NOT_FOUND_WIRE;
+  if (method === 'GET' && git.suffix === 'info/refs') {
+    if (git.service === 'git-upload-pack') {
+      if (gitV2) return V2_ADVERTISEMENT_WIRE;
+      return bytesWire(200, v0Advertisement(repo, git.service), UPLOAD_ADVERTISEMENT_TYPE);
+    }
+    if (git.service === 'git-receive-pack') {
+      return bytesWire(200, v0Advertisement(repo, git.service), RECEIVE_ADVERTISEMENT_TYPE);
+    }
+    return NOT_FOUND_WIRE;
+  }
+  if (method === 'POST' && git.suffix === 'git-upload-pack') {
+    try {
+      return uploadWire(repo, input.subarray(start, end));
+    } catch {
+      return INVALID_UPLOAD_WIRE;
+    }
+  }
+  if (method === 'POST' && git.suffix === 'git-receive-pack') {
+    try {
+      return bytesWire(200, receivePackResponse(repo, input.subarray(start, end)), RECEIVE_RESULT_TYPE);
+    } catch {
+      return RECEIVE_ERROR_WIRE;
+    }
+  }
+}
+
+async function dispatchHttp(req: Request, res: HttpResponse): Promise<void> {
+  const method = req.method ?? 'GET';
+  const target = req.url ?? '/';
+  const route = authorised(req) ? liveIssueRoute(method, target) : undefined;
+  // Resolve only authenticated, still-live repositories. The issue record is live too:
+  // sendIssue checks its mutable state before reusing serialized bytes.
+  if (route) {
+    if (method === 'GET' && route.issue) {
+      sendIssue(res, 200, route.issue);
       return;
     }
-
-    const git = cachedGit ?? parseGitPath(path, url);
-    if (git) {
-      if (!authorised(req)) {
-        sendJson(res, 401, { message: 'Bad credentials' });
-        return;
+    if (method === 'POST') {
+      try {
+        const issue = createIssue(route.repo, await jsonBody(req));
+        if (!issue) sendJson(res, 422, { message: 'Validation Failed: label does not exist' });
+        else sendIssue(res, 201, issue);
+      } catch {
+        sendJson(res, 400, { message: 'Problems parsing JSON' });
       }
-      const repo = store.get(git.owner, git.name);
-      if (!repo) {
-        sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
-      if (!cachedGit && target.length <= GIT_ROUTE_MAX_TARGET_LENGTH) {
-        if (gitRoutes.size >= GIT_ROUTE_CACHE_LIMIT) gitRoutes.clear();
-        gitRoutes.set(target, git);
-      }
-      if (method === 'GET' && git.suffix === 'info/refs') {
-        const service = git.service;
-        if (service === 'git-upload-pack' || service === 'git-receive-pack') handleInfoRefs(req, res, repo, service);
-        else sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
-      if (method === 'POST' && git.suffix === 'git-upload-pack') {
-        await handleUploadPack(req, res, repo);
-        return;
-      }
-      if (method === 'POST' && git.suffix === 'git-receive-pack') {
-        await handleReceivePack(req, res, repo);
-        return;
-      }
-    }
-
-    if (path === '/api/graphql' && method === 'POST') {
-      await handleGraphQL(req, res);
       return;
     }
+  }
+  const cachedGit = gitRoutes.get(target);
+  const url = cachedGit ? null : requestUrl(target);
+  const path = cachedGit?.path ?? url?.pathname ?? '/';
 
-    if (path === '/mcp' && method === 'POST') {
-      await handleMcp(req, res);
-      return;
-    }
+  // The env's boot check calls this twice: 200 {"ok":true}.
+  if (method === 'GET' && path === '/healthz') {
+    sendJson(res, 200, { ok: true });
+    return;
+  }
 
-    if (path.startsWith('/api/v3') && !authorised(req)) {
+  const git = cachedGit ?? parseGitPath(path, url);
+  if (git) {
+    if (!authorised(req)) {
       sendJson(res, 401, { message: 'Bad credentials' });
       return;
     }
-
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+    const repo = store.get(git.owner, git.name);
+    if (!repo) {
+      sendJson(res, 404, { message: 'Not Found' });
       return;
     }
+    if (!cachedGit && target.length <= GIT_ROUTE_MAX_TARGET_LENGTH) {
+      if (gitRoutes.size >= GIT_ROUTE_CACHE_LIMIT) gitRoutes.clear();
+      gitRoutes.set(target, git);
+    }
+    if (method === 'GET' && git.suffix === 'info/refs') {
+      const service = git.service;
+      if (service === 'git-upload-pack' || service === 'git-receive-pack') handleInfoRefs(req, res, repo, service);
+      else sendJson(res, 404, { message: 'Not Found' });
+      return;
+    }
+    if (method === 'POST' && git.suffix === 'git-upload-pack') {
+      await handleUploadPack(req, res, repo);
+      return;
+    }
+    if (method === 'POST' && git.suffix === 'git-receive-pack') {
+      await handleReceivePack(req, res, repo);
+      return;
+    }
+  }
 
-    if (path.startsWith('/api/v3') && await handleIssueHotPath(req, res, path, method)) return;
+  if (path === '/api/graphql' && method === 'POST') {
+    await handleGraphQL(req, res);
+    return;
+  }
 
-    if (path.startsWith('/api/v3') && await handleRest(req, res, path, method)) return;
+  if (path === '/mcp' && method === 'POST') {
+    await handleMcp(req, res);
+    return;
+  }
 
-    sendJson(res, 404, { message: 'Not Found' });
-  });
+  if (path.startsWith('/api/v3') && !authorised(req)) {
+    sendJson(res, 401, { message: 'Bad credentials' });
+    return;
+  }
+
+  if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
+    sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+    return;
+  }
+
+  if (path.startsWith('/api/v3') && await handleIssueHotPath(req, res, path, method)) return;
+
+  if (path.startsWith('/api/v3') && await handleRest(req, res, path, method)) return;
+
+  sendJson(res, 404, { message: 'Not Found' });
+}
+
+/** Build the server. It binds nothing until the caller listens. */
+export function createApp(): HybridServer {
+  return createHybridServer(createServer(dispatchHttp), TOKEN, dispatchHot, dispatchHttp);
 }

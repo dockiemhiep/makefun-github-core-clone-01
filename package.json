@@ -10,6 +10,6 @@
   },
   "scripts": {
     "start": "node --experimental-strip-types main.ts",
-    "test": "node test/body-limit.test.mjs"
+    "test": "node --test test/*.test.mjs"
   }
 }

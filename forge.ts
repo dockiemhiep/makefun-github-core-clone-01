@@ -66,7 +66,7 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   header.write('PACK', 0, 4, 'ascii');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
-  const parts = [header];
+  const parts: Buffer[] = [header];
   for (const object of list) parts.push(objectHeader(object.type, object.data.length), deflateSync(object.data, { level: 1 }));
   const body = Buffer.concat(parts);
   return Buffer.concat([body, hash('sha1', body, 'buffer')]);

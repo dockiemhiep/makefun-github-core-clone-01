@@ -448,3 +448,126 @@ Every final run scored Feature 600/600, Agent 200/200 and Perf 200/200. These ar
 - Lint and typechecking were skipped because the repository provides neither command and
   `tsc` was unavailable on PATH. Browser checks are outside this server-only scope.
 - Task containers were auto-removed after the checks. No server process from the task remains.
+
+## Perf Round 4 (2026-11-20)
+
+Base `2674543`. The implementation used the research report's design and the
+existing application code. It was written independently of the prototype patches.
+
+### Priority 1 — HTTP/1.1 transport
+
+- The listener uses `node:net` and one shared set of socket event handlers. The raw
+  parser validates the request line and framing, compares the encoded bearer value,
+  and reads only the three application headers. Hot routes dispatch synchronously
+  and write a complete response buffer. Ordinary requests such as repository
+  DELETE and recreate use the existing dispatcher through a buffered request and
+  response on the same socket.
+- The unbound `node:http` server owns unusual or invalid framing, including chunked
+  bodies, Expect, Upgrade, connection closing, and bodies over 4 MiB. Its 64 MiB
+  cap and pack processing remain in effect. The raw shim omits Content-Length on
+  204 and 304. The normal listener also closes idle and handed-off connections.
+- Issue reads reuse bytes only for the current issue state. GET and POST route
+  lookups check bearer authorization, live repository identity, owner, and
+  generation. DELETE clears both route maps. Empty-label issue creation uses
+  the same JSON field order and string escaping as the existing serializer.
+- Clone advertisements and upload responses reuse framed bytes. Upload answers
+  use the existing repository weak key, generation, object count, default branch
+  and exact request bytes. The cached HTTP frame and Git body share one backing
+  buffer. The optional request-body MRU was left out.
+
+### Official Docker comparison
+
+Every invocation ran from the v27 kit with `TMPDIR=$HOME/makefun-grade-tmp/` and
+`node cli/makefun.mjs grade-local --driver docker --kit . --bot <repo>`. Baseline
+runs used `--commit 2674543` and the following candidate runs used `--worktree`.
+Both arms used the pinned Node 22.23.4 entry image. The grader reported its existing
+host harness v24.21.0 versus server harness v26.13.1 mismatch. Every run started at
+one-minute load at or below 6. The decision statistic is the geometric mean of
+the paired candidate/base ratios for aggregate `perf_p50_us`.
+
+#### Initial screening pair
+
+| Run | Load | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us | Feature | Agent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 2.66 | 83.022 | 27.316 | 237.636 | 30.820 | 63,839 | 600 | 200 |
+| Candidate 1 | 2.63 | 78.293 | 26.601 | 228.901 | 26.563 | 59,654 | 600 | 200 |
+
+Paired candidate/base ratios: 0.934444
+Aggregate paired geomean 0.934444 (-6.56%).
+Push paired geomean 0.943039 (-5.70%).
+Correctness gates across all runs: PASS.
+
+#### First five pairs
+
+This series preceded the bare-LF and legacy Proxy-Connection framing fixes.
+
+| Run | Load | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us | Feature | Agent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 2.18 | 107.389 | 30.447 | 212.256 | 31.169 | 68,198 | 600 | 200 |
+| Candidate 1 | 3.13 | 80.361 | 26.488 | 192.307 | 26.744 | 57,521 | 600 | 200 |
+| Base 2 | 3.05 | 82.904 | 27.885 | 213.228 | 32.579 | 63,304 | 600 | 200 |
+| Candidate 2 | 3.19 | 81.058 | 27.428 | 198.870 | 29.293 | 59,990 | 600 | 200 |
+| Base 3 | 3.43 | 84.354 | 32.558 | 211.093 | 30.622 | 64,911 | 600 | 200 |
+| Candidate 3 | 3.06 | 81.085 | 26.641 | 200.621 | 28.038 | 59,041 | 600 | 200 |
+| Base 4 | 3.02 | 84.910 | 29.440 | 217.819 | 30.592 | 63,885 | 600 | 200 |
+| Candidate 4 | 3.59 | 80.038 | 27.771 | 190.239 | 26.837 | 58,040 | 600 | 200 |
+| Base 5 | 3.88 | 89.696 | 28.990 | 220.570 | 32.103 | 65,506 | 600 | 200 |
+| Candidate 5 | 3.77 | 83.006 | 27.016 | 203.104 | 36.303 | 63,767 | 600 | 200 |
+
+Paired candidate/base ratios: 0.843441, 0.947649, 0.909568, 0.908507, 0.973453
+Aggregate paired geomean 0.915453 (-8.45%).
+Push paired geomean 0.906907 (-9.31%).
+Correctness gates across all runs: PASS.
+
+#### Confirmed Priority 1 tree
+
+| Run | Load | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us | Feature | Agent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 2.13 | 83.652 | 30.262 | 210.259 | 29.069 | 62,718 | 600 | 200 |
+| Candidate 1 | 2.63 | 81.068 | 28.244 | 198.524 | 27.847 | 59,647 | 600 | 200 |
+| Base 2 | 2.68 | 82.859 | 28.604 | 211.571 | 29.911 | 62,232 | 600 | 200 |
+| Candidate 2 | 2.46 | 79.050 | 26.549 | 202.789 | 27.304 | 58,386 | 600 | 200 |
+| Base 3 | 2.40 | 87.320 | 27.978 | 214.292 | 29.105 | 62,478 | 600 | 200 |
+| Candidate 3 | 2.79 | 83.094 | 29.417 | 192.166 | 28.237 | 60,348 | 600 | 200 |
+| Base 4 | 2.81 | 84.214 | 27.599 | 213.459 | 29.264 | 61,728 | 600 | 200 |
+| Candidate 4 | 3.17 | 79.166 | 25.112 | 207.114 | 28.841 | 58,703 | 600 | 200 |
+| Base 5 | 3.07 | 81.972 | 26.997 | 209.049 | 30.138 | 61,106 | 600 | 200 |
+| Candidate 5 | 3.13 | 78.289 | 29.127 | 202.295 | 28.312 | 60,116 | 600 | 200 |
+
+Paired candidate/base ratios: 0.951035, 0.938199, 0.965908, 0.950995, 0.983799
+Aggregate paired geomean 0.957861 (-4.21%).
+Push paired geomean 0.953929 (-4.61%).
+Correctness gates across all runs: PASS.
+
+**GO for Priority 1.** The confirmed tree cleared the 3% target with full correctness.
+These timings are from local Docker.
+
+### Priority 1 verification
+
+- All official runs above returned EXIT=0 with Feature 600/600 (120/120 checks),
+  Agent 200/200 (MCP 15/15), Perf 200/200, three timed rounds per workload, and
+  matching live and L1 replay state. The official grading runs exercised
+  startup, registration and shutdown through the unchanged `main.ts`.
+- `npm test`, pinned Docker Node 22.23.4, EXIT=0 (10/10). The body-limit test
+  accepted 64 MiB, returned the existing JSON 400 for 64 MiB + 1, and reused the
+  socket. The transport tests exercised DELETE 204 and recreate on one socket,
+  pipelined execution and response order, backpressure, split TCP headers and
+  body, chunked and Expect handoff, closing connections, malformed framing, and
+  PATCH issue-state invalidation.
+- The Node 22.23.2 differential against archived `2674543` returned EXIT=0 with 35
+  matching statuses, headers and body byte sequences after the explicit shim
+  204 Content-Length normalization. It exercised cold and cached Git answers,
+  stale-push object-count and ref-generation invalidation, receive-pack errors,
+  token and owner checks, and delete/recreate. GC found zero live Repository
+  instances after both deletions with both versions.
+- `node --check` for `main.ts`, `app.ts`, `forge.ts`, `raw-http.ts` and both test
+  files returned EXIT=0. `tsc --project tsconfig.json` with installed TypeScript
+  6.0.3 and Node types 26.6.2 returned EXIT=0. A type-only Buffer array annotation
+  addresses an inference error in the base's pack writer. The repository has
+  no lint command.
+- `git diff --check`, `git diff --cached --check`, `git diff 2674543 --check` and
+  `git diff --exit-code 2674543 -- main.ts` returned EXIT=0. Scoped review covered
+  framing, auth, cache state and body bounds. There are no runtime dependencies.
+- Evidence, including raw grade and replay exports, workload round times, gate
+  logs and scripts, is in
+  `/Users/conan/Workspace/makefun-bounties/github-round4-evidence/`.

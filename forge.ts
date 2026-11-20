@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, hash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 export const ZERO_OID = '0'.repeat(40);
@@ -10,8 +10,16 @@ const CODE_TYPE: Record<number, ObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
 
 export function hashObject(type: ObjectType, data: Uint8Array): string {
-  const body = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-  return createHash('sha1').update(`${type} ${body.length}\0`).update(body).digest('hex');
+  const header = `${type} ${data.byteLength}\0`;
+  // Small loose objects fit in one Buffer pool allocation. Stream larger objects
+  // through the hash to avoid copying their contents.
+  if (header.length + data.byteLength < Buffer.poolSize / 2) {
+    const object = Buffer.allocUnsafe(header.length + data.byteLength);
+    object.write(header, 'ascii');
+    object.set(data, header.length);
+    return hash('sha1', object);
+  }
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 export function pkt(payload: string | Buffer): Buffer {
@@ -61,7 +69,7 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   const parts = [header];
   for (const object of list) parts.push(objectHeader(object.type, object.data.length), deflateSync(object.data, { level: 1 }));
   const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  return Buffer.concat([body, hash('sha1', body, 'buffer')]);
 }
 
 function readObjectHeader(buffer: Buffer, start: number): { type: ObjectType; size: number; next: number } {
@@ -84,7 +92,7 @@ function readObjectHeader(buffer: Buffer, start: number): { type: ObjectType; si
 export function readPack(pack: Buffer): Map<string, GitObject> {
   if (pack.length < 32 || pack.subarray(0, 4).toString() !== 'PACK' || pack.readUInt32BE(4) !== 2) throw new Error('invalid pack');
   const trailer = pack.subarray(pack.length - 20);
-  const expected = createHash('sha1').update(pack.subarray(0, -20)).digest();
+  const expected = hash('sha1', pack.subarray(0, -20), 'buffer');
   if (!trailer.equals(expected)) throw new Error('bad pack checksum');
   const count = pack.readUInt32BE(8);
   const result = new Map<string, GitObject>();

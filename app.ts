@@ -54,12 +54,11 @@ function sendBytes(res: ServerResponse, status: number, body: Buffer, type: stri
   res.end(body);
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+function requestUrl(target: string): URL | null {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(target, 'http://entry');
   } catch {
-    return '/';
+    return null;
   }
 }
 
@@ -804,11 +803,31 @@ async function handleIssueHotPath(req: IncomingMessage, res: ServerResponse, pat
   return false;
 }
 
-function parseGitPath(path: string): { owner: string; name: string; suffix: string } | null {
+interface GitRoute {
+  path: string;
+  owner: string;
+  name: string;
+  suffix: string;
+  service: string | null;
+}
+
+// Cache only URL parsing. Every request still resolves the live repository and checks auth.
+const gitRoutes = new Map<string, GitRoute>();
+const GIT_ROUTE_CACHE_LIMIT = 64;
+const GIT_ROUTE_MAX_TARGET_LENGTH = 1024;
+
+function parseGitPath(path: string, url: URL | null): GitRoute | null {
   const match = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
   if (!match) return null;
   try {
-    return { owner: decodeURIComponent(match[1]), name: decodeURIComponent(match[2]), suffix: match[3] };
+    const suffix = match[3];
+    return {
+      path,
+      owner: decodeURIComponent(match[1]),
+      name: decodeURIComponent(match[2]),
+      suffix,
+      service: suffix === 'info/refs' ? url?.searchParams.get('service') ?? null : null,
+    };
   } catch {
     return null;
   }
@@ -996,7 +1015,10 @@ export function createApp(): Server {
         return;
       }
     }
-    const path = pathOf(req);
+    const target = req.url ?? '/';
+    const cachedGit = gitRoutes.get(target);
+    const url = cachedGit ? null : requestUrl(target);
+    const path = cachedGit?.path ?? url?.pathname ?? '/';
 
     // The env's boot check calls this twice: 200 {"ok":true}.
     if (method === 'GET' && path === '/healthz') {
@@ -1004,7 +1026,7 @@ export function createApp(): Server {
       return;
     }
 
-    const git = parseGitPath(path);
+    const git = cachedGit ?? parseGitPath(path, url);
     if (git) {
       if (!authorised(req)) {
         sendJson(res, 401, { message: 'Bad credentials' });
@@ -1015,9 +1037,12 @@ export function createApp(): Server {
         sendJson(res, 404, { message: 'Not Found' });
         return;
       }
-      const url = new URL(req.url ?? '/', 'http://entry');
+      if (!cachedGit && target.length <= GIT_ROUTE_MAX_TARGET_LENGTH) {
+        if (gitRoutes.size >= GIT_ROUTE_CACHE_LIMIT) gitRoutes.clear();
+        gitRoutes.set(target, git);
+      }
       if (method === 'GET' && git.suffix === 'info/refs') {
-        const service = url.searchParams.get('service');
+        const service = git.service;
         if (service === 'git-upload-pack' || service === 'git-receive-pack') handleInfoRefs(req, res, repo, service);
         else sendJson(res, 404, { message: 'Not Found' });
         return;

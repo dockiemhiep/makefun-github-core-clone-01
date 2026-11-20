@@ -329,3 +329,122 @@ Probe scripts, archived pre-fix source, exact runtime diff, SDK output, all ten 
 exports, timing summary and load logs are retained outside the repository at
 `$HOME/makefun-grade-tmp/round2-priced-fix/`. Test servers exited, task containers were auto-removed,
 and nothing was submitted or pushed.
+
+## Perf Round 3 (2026-11-20)
+
+### Method
+
+- Base was `f39b593`. The first official Docker run scored Feature 600, Agent 200 and Perf 200 with
+  `perf_p50_us` **64,981**.
+- The unchanged kit measures 200 sequential pushes of one 1 KiB change, 50 concurrent depth-1
+  clones from a 200-commit repository, 2,000 sequential issue GETs and 200 sequential issue POSTs
+  per round. Every workload has five warm-up operations and three timed rounds.
+- Official runs used the kit's `node cli/makefun.mjs grade-local --driver docker --kit . --bot <repo>`
+  with `--commit f39b593` for the base, `--worktree` for the candidate, and
+  `TMPDIR=$HOME/makefun-grade-tmp/` on every invocation. The entry image was pinned at
+  `de170b39439e…` for both. The CLI reported its host harness Node v24.21.0 versus the grader's
+  harness v26.13.1 mismatch on both arms. The entry runtime was Node v22.23.4.
+- V8 inspector sampled the server at a configured 100 µs interval, with one profile per workload
+  over 25 rounds. Diagnostics used Node v22.23.4 and undici 6.29.1 on arm64 in
+  `node:22-alpine`, with 2 CPUs and 1,024 MiB. The entry ran through `main.ts` with a stub
+  coordinator. Unprofiled 25-round diagnostics measured entry user plus system CPU with
+  `process.cpuUsage()`, including workload setup. Each experiment was staged and compared with
+  its preceding code in fresh entry processes. The official experiment figures compare each
+  staged worktree with `f39b593` in a single pair.
+- `uptime` was recorded before every timing run and the runners waited if one-minute load
+  exceeded 6. Final official runs started at loads **3.29–4.87**.
+  All completed runs are retained. Two early diagnostic containers needed termination after collecting
+  samples because the profiler runner left its IPC channel open. The runner was corrected and both
+  the baseline profiles and the inflate comparison were rerun before they were used.
+- Scripts, patches, load and exit logs, full profiles and grade exports are in
+  `/Users/conan/Workspace/makefun-bounties/github-round3-evidence/`. Final official runs have
+  prefixes `final-base` and `final-new`.
+
+### Profiles and staged changes
+
+The push profile's largest application costs included receive-pack dispatch and parsing, Git URL
+parsing, SHA-1, and v0 advertisement assembly. Clone repeatedly hit the existing upload cache,
+so URL dispatch remained one of the larger application costs. Commit parsing, reachability, pack
+compression and sideband framing were small in these profiles. Node HTTP writes dominated the
+issue workloads. Issue creation also spent samples in JSON parsing and response serialization.
+
+| Retained change | Isolated median entry CPU, ms per 25-round phase | Official aggregate in the corresponding pair, µs |
+| --- | --- | ---: |
+| Use one-shot SHA-1 for pack trailers and small loose objects | push 919.732 → 915.321 (0.48% lower)<br>clone 276.140 → 257.415 (6.78% lower) | 63,429 → 61,252 |
+| Cache parsed Git targets by exact request URL | push 922.584 → 869.040 (5.80% lower)<br>clone 278.535 → 247.459 (11.16% lower) | 62,468 → 62,547 |
+
+SHA-1 uses the same header and object bytes, with streaming for larger objects. The Git URL cache
+retains up to 64 parsed targets of at most 1,024 characters. It stores strings, and each request
+still checks the exact token and looks up the live repository. Fetch caching still checks repository
+identity, generation, object count and default branch. Issue-route checks and deletion eviction
+are intact.
+
+| Rejected experiment | Median entry CPU, ms per 25-round phase | Official aggregate in the corresponding pair, µs |
+| --- | --- | ---: |
+| Additional byte of inflate output space | push 988.139 → 1053.840 | 64,141 → 63,993 |
+| Key issue routes by target string and check method separately | read 1511.023 → 1506.671<br>write 252.093 → 251.557 | 61,070 → 59,689 |
+| Defer issue serialization caching until the first GET | read 1309.248 → 1344.514<br>write 461.092 → 469.381 | 61,367 → 60,295 |
+| Encode string pkt-lines in one Buffer | push 875.539 → 867.331<br>clone 238.928 → 240.903 | 61,823 → 63,981 |
+| Limit receive-command splitting and avoid splitting capabilities | push 877.550 → 878.423 | 61,930 → 61,803 |
+| Reuse service framing and assemble v0 advertisement rows directly | push 878.078 → 870.847 | 63,324 → 63,462 |
+| Use terminal request-body listeners without once wrappers | push 880.575 → 878.547<br>write 251.299 → 254.872 | 63,582 → 61,671 |
+
+The diagnostic phases had three pairs each, with five pairs for the issue-route experiment. The
+rejected changes either regressed the affected workload or produced shifts too small to establish a
+reliable benefit. A generation-keyed v0 answer cache would miss after each successful push. Parsed
+commit caching and changes to fetch walks or compression were left out based on the profile and
+the existing upload-response cache.
+
+The combined diagnostic was three alternating pairs of 25-round workloads.
+
+| Entry CPU median (ms per phase) | Base | Candidate |
+| --- | ---: | ---: |
+| push | 924.975 | 899.318 |
+| clone | 294.116 | 247.370 |
+| read | 1342.230 | 1364.510 |
+| write | 198.691 | 194.154 |
+
+### Final interleaved official Docker comparison
+
+Each row is a fresh grade-local invocation. The aggregate median uses the five recorded
+`perf_p50_us` values for that arm.
+
+| Run in execution order | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 86.903 | 28.387 | 211.811 | 29.273 | 62,538 |
+| Candidate 1 | 85.182 | 28.224 | 219.132 | 30.316 | 63,217 |
+| Base 2 | 101.399 | 35.840 | 238.173 | 33.365 | 73,307 |
+| Candidate 2 | 86.772 | 27.957 | 209.926 | 31.611 | 63,342 |
+| Base 3 | 89.107 | 27.676 | 216.350 | 31.444 | 64,000 |
+| Candidate 3 | 82.823 | 28.090 | 201.516 | 29.072 | 60,761 |
+| Base 4 | 86.086 | 31.225 | 211.356 | 36.354 | 67,414 |
+| Candidate 4 | 83.948 | 26.900 | 215.188 | 32.938 | 63,251 |
+| Base 5 | 85.567 | 28.664 | 207.197 | 30.528 | 62,760 |
+| Candidate 5 | 83.291 | 28.476 | 214.828 | 29.569 | 62,302 |
+| **Base median** | 86.903 | 28.664 | 211.811 | 31.444 | 64,000 |
+| **Candidate median** | 83.948 | 28.090 | 214.828 | 30.316 | 63,217 |
+
+**NO-GO.** The official aggregate median was **1.22% lower** against the 3.00% goal.
+Every final run scored Feature 600/600, Agent 200/200 and Perf 200/200. These are local Docker timings.
+
+### Verification
+
+- All 29 official Docker runs returned EXIT=0. Every run completed 120/120 checks including
+  MCP 15/15, all four workloads, and L1 replay with zero nondeterministic trials.
+- The unmodified SDK full suite through `main.ts` returned EXIT=0 with 120/120 checks,
+  MCP 15/15, and Perf 200.
+- `npm test` returned EXIT=0 in pinned Node 22. The test passed at 64 MiB, rejected 64 MiB + 1
+  with the existing JSON 400 body, and reused the socket for the next request.
+- `node --check main.ts`, `node --check app.ts`, `node --check forge.ts` and the existing test
+  file's syntax check returned EXIT=0.
+- The comparative HTTP and object-hash check returned EXIT=0 with 180 assertions. It covered
+  exact response headers and bytes, URL normalization, eviction, token rejection after warm-up,
+  receive-pack validation and per-ref reports, fetch invalidation after a stale push ingested
+  objects, issue state, annotated tags, and repository deletion and same-name recreation. Both
+  implementations released deleted Repository instances after GC.
+- `git diff --check`, `git diff --cached --check`, and `git diff f39b593 --check` returned
+  EXIT=0. Manual review covered bearer-token and cache guards, checksum, object length, and
+  validation order. Runtime edits are limited to Git URL parsing and SHA-1 hashing.
+- Lint and typechecking were skipped because the repository provides neither command and
+  `tsc` was unavailable on PATH. Browser checks are outside this server-only scope.
+- Task containers were auto-removed after the checks. No server process from the task remains.

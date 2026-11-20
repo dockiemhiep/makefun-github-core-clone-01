@@ -36,7 +36,7 @@ async function open(t) {
     return true;
   }
 
-  async function response() {
+  async function response({ headOnly = false } = {}) {
     let end;
     while ((end = pending.indexOf('\r\n\r\n')) < 0) assert.ok(await more(), 'connection ended before headers');
     const [line, ...fields] = pending.toString('latin1', 0, end).split('\r\n');
@@ -45,7 +45,7 @@ async function open(t) {
       const colon = field.indexOf(':');
       return [field.slice(0, colon).toLowerCase(), field.slice(colon + 1).trim()];
     }));
-    const finish = end + 4 + Number(headers['content-length'] ?? 0);
+    const finish = end + 4 + (headOnly ? 0 : Number(headers['content-length'] ?? 0));
     while (pending.length < finish) assert.ok(await more(), 'connection ended before body');
     const data = pending.subarray(end + 4, finish);
     pending = pending.subarray(finish);
@@ -57,8 +57,43 @@ async function open(t) {
     return response();
   }
 
-  return { socket, server, exchange, response, more };
+  async function remaining() {
+    while (await more()) {}
+    return pending;
+  }
+
+  return { socket, server, exchange, response, more, remaining };
 }
+
+test('HEAD on a warmed Git URL sends error headers without body bytes', { timeout: 5000 }, async (t) => {
+  for (const { name, remove, headers, status, length } of [
+    { name: 'head-denied', remove: false, headers: 'Host: localhost\r\n', status: 401, length: '30' },
+    { name: 'head-deleted', remove: true, headers: credentials, status: 404, length: '24' },
+  ]) {
+    await t.test(name, async (t) => {
+      const { socket, exchange, response, remaining } = await open(t);
+      const ad = `/alice/${name}.git/info/refs?service=git-upload-pack`;
+      assert.equal((await exchange('POST', '/api/v3/user/repos', { name })).status, 201);
+      assert.equal((await exchange('GET', ad, undefined, credentials + 'Git-Protocol: version=2\r\n')).status, 200);
+      if (remove) assert.equal((await exchange('DELETE', `/api/v3/repos/alice/${name}`)).status, 204);
+
+      socket.end(request('HEAD', ad, undefined, headers));
+      const head = await response({ headOnly: true });
+      assert.equal(head.status, status);
+      assert.equal(head.headers['content-length'], length);
+      assert.equal((await remaining()).length, 0, 'bytes after the HEAD headers');
+    });
+  }
+});
+
+test('half-closing a short health request preserves the health response before the parser error', { timeout: 5000 }, async (t) => {
+  const { socket, response, remaining } = await open(t);
+  socket.end(`GET /healthz HTTP/1.1\r\n${credentials}Content-Length: 2\r\n\r\nx`);
+  const health = await response();
+  assert.equal(health.status, 200);
+  assert.equal(health.data.toString(), '{"ok":true}\n');
+  assert.equal((await remaining()).toString(), 'HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+});
 
 test('pipelined issue create, read and close preserve bytes and invalidate the read cache', { timeout: 5000 }, async (t) => {
   const repo = '/api/v3/repos/alice/pipeline';
@@ -119,6 +154,31 @@ test('DELETE 204 and same-socket recreation evict both issue routes', { timeout:
   assert.equal(current.status, 200);
   assert.equal(current.json().title, 'new');
   assert.deepEqual(current.data, created.data);
+});
+
+test('DELETE with Connection close sends 204 without length or body bytes', { timeout: 5000 }, async (t) => {
+  const { socket, exchange, response, remaining } = await open(t);
+  assert.equal((await exchange('POST', '/api/v3/user/repos', { name: 'delete-close' })).status, 201);
+  socket.write(request('DELETE', '/api/v3/repos/alice/delete-close', undefined, credentials + 'Connection: close\r\n'));
+  const deleted = await response({ headOnly: true });
+  assert.equal(deleted.status, 204);
+  assert.equal(deleted.headers['content-length'], undefined);
+  assert.equal(deleted.headers['transfer-encoding'], undefined);
+  assert.equal(deleted.headers.connection, 'close');
+  assert.equal((await remaining()).length, 0);
+});
+
+test('the pagination Link encodes a Latin-1 Host byte as UTF-8', { timeout: 5000 }, async (t) => {
+  const { socket, exchange, response } = await open(t);
+  for (const name of ['pagination-first', 'pagination-second']) {
+    assert.equal((await exchange('POST', '/api/v3/user/repos', { name })).status, 201);
+  }
+  const headers = credentials.replace('localhost', 'café.example');
+  socket.write(Buffer.from(request('GET', '/api/v3/user/repos?per_page=1', undefined, headers), 'latin1'));
+  const page = await response();
+  assert.equal(page.status, 200);
+  assert.deepEqual(Buffer.from(page.headers.link, 'latin1'),
+    Buffer.from('<http://café.example/api/v3/user/repos?per_page=1&page=2>; rel="next"', 'utf8'));
 });
 
 test('split request line, header terminator and UTF-8 body can precede a pipelined request', { timeout: 5000 }, async (t) => {

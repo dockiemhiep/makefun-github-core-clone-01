@@ -43,14 +43,8 @@ function statusLine(status: number): string {
 }
 
 function joinWire(head: string, body: Buffer | string): Buffer {
-  if (typeof body === 'string') {
-    // Shim header values are Latin-1 and JSON bodies are UTF-8.
-    const headerSize = head.length;
-    const wire = Buffer.allocUnsafe(headerSize + Buffer.byteLength(body));
-    wire.write(head, 0, headerSize, 'latin1');
-    wire.write(body, headerSize, 'utf8');
-    return wire;
-  }
+  // Node encodes the headers with the first string body write, and uses Latin-1 for Buffer bodies.
+  if (typeof body === 'string') return Buffer.from(head + body, 'utf8');
   const wire = Buffer.allocUnsafe(head.length + body.length);
   wire.write(head, 0, head.length, 'latin1');
   body.copy(wire, head.length);
@@ -316,7 +310,9 @@ class RawHttpConnection {
       }
 
       this.timeoutAt = 0;
-      const wire = this.server.hotDispatch(this.method, this.target, this.authorised, this.gitV2, input, bodyStart, bodyEnd);
+      // Complete cached frames include a body. HEAD uses the buffered header-only writer.
+      const wire = this.method === 'HEAD' ? undefined
+        : this.server.hotDispatch(this.method, this.target, this.authorised, this.gitV2, input, bodyStart, bodyEnd);
       start = bodyEnd;
       if (wire === undefined) {
         this.dispatching = true;
@@ -427,7 +423,10 @@ class RawHttpConnection {
     } else {
       this.waitForRequest();
     }
-    if (socket[rawConnection] && !this.dispatching && !socket.writableNeedDrain) socket.resume();
+    if (socket[rawConnection] && !this.dispatching && !socket.writableNeedDrain) {
+      if (socket.readableEnded && !socket.writableEnded) this.finishInput();
+      else socket.resume();
+    }
   }
 
   waitForRequest(): void {
@@ -439,7 +438,11 @@ class RawHttpConnection {
   }
 
   finishInput(): void {
-    if (this.pending || this.bodyParts) this.socket.end(BAD_REQUEST);
+    if (this.bodyParts) {
+      // Replay the incomplete request so Node can dispatch from its headers before checking EOF.
+      const input = this.bodyParts.length === 1 ? this.bodyParts[0] : Buffer.concat(this.bodyParts, this.received);
+      this.handoff(input);
+    } else if (this.pending) this.socket.end(BAD_REQUEST);
     else this.socket.end();
   }
 
@@ -455,10 +458,15 @@ class RawHttpConnection {
     socket.off('timeout', onIdle);
     delete socket[rawConnection];
     // The HTTP engine manages FIN and idle timers for the rest of this socket's life.
-    socket.allowHalfOpen = true;
     server.fallback.emit('connection', socket);
     socket.emit('data', input);
-    if (!socket.destroyed) socket.resume();
+    if (socket.destroyed) return;
+    if (socket.readableEnded) {
+      // Give header-only dispatch and response completion their usual turn before the FIN.
+      setImmediate(() => { if (!socket.destroyed) socket.emit('end'); });
+    } else {
+      socket.resume();
+    }
   }
 }
 
@@ -490,7 +498,7 @@ export function createHybridServer(fallback: HttpServer, token: string, hotDispa
     connections: new Set(),
   };
 
-  const server = createServer({ noDelay: true, allowHalfOpen: false }, (socket) => {
+  const server = createServer({ noDelay: true, allowHalfOpen: true }, (socket) => {
     transport.connections.add(new RawHttpConnection(socket, transport));
   }) as HybridServer;
   let timeoutCheck: NodeJS.Timeout;

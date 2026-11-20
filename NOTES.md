@@ -708,3 +708,19 @@ All final pairs cleared Feature 600/600 and Agent 200/200. The grading ran in lo
   typecheck, staged and base-relative `git diff --check` runs, and the
   `main.ts` unchanged check returned EXIT=0. The repository has no lint
   command. Task containers auto-removed and test listeners closed.
+
+### Astra review fixes
+
+| Finding | Change | Regression evidence |
+| --- | --- | --- |
+| Warm Git errors sent bodies on HEAD | The raw transport routes every HEAD through the buffered header-only writer before attempting any complete-frame dispatch. | Socket tests warm the upload advertisement, then count zero body bytes on a 401 with advertised length 30 and a post-delete 404 with advertised length 24. |
+| Half-close lost the health response | At EOF during an incomplete fixed-length body, the transport hands the saved header and partial body to Node. It replays FIN after Node has had a turn to dispatch and finish any response it can send from the headers. | A health GET declares two body bytes, sends one and half-closes. The test reads the full 200 health response, then Node's 400 frame and EOF. |
+| Native DELETE sent a length on 204 | The shared 204 helper omits Content-Length. | Socket tests check 204 framing on a reused connection and a `Connection: close` handoff. The HTTP differential retains the headers and expects the base's length of zero to be absent on both candidate paths. |
+| Pagination Link changed Host bytes | The buffered writer encodes headers and a string body together as UTF-8, matching Node's write. | An incoming Host byte `e9` produces `c3 a9` in the next-page Link. The raw socket test compares the full Link value as bytes. |
+
+The raw-write review covered complete cached frames, buffered responses,
+parser errors, timeouts, and native handoffs. Authentication and repository
+checks still use the existing dispatcher. The regression tests failed on
+`bbd9c4b` for all four findings. The pinned gates, HTTP and pack comparisons,
+and three interleaved v27 grade-local pairs are recorded in the Round 4
+evidence directory in the `fix-*` logs.

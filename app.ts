@@ -143,9 +143,9 @@ function repoJson(repo: Repository): Record<string, unknown> {
   };
 }
 
-function sendEmpty(res: HttpResponse, status: number): void {
+function sendNoContent(res: HttpResponse): void {
   res.sendDate = false;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': '0', 'x-github-request-id': 'MF-FORGE' });
+  res.writeHead(204, { 'content-type': JSON_TYPE, 'x-github-request-id': 'MF-FORGE' });
   res.end();
 }
 
@@ -798,7 +798,7 @@ async function handleRest(req: Request, res: HttpResponse, path: string, method:
         store.repos.delete(repo.name);
         getIssueRoutes.clear();
         postIssueRoutes.clear();
-        sendEmpty(res, 204);
+        sendNoContent(res);
       }
       else return false;
       return true;

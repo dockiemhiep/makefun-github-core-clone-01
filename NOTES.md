@@ -571,3 +571,140 @@ These timings are from local Docker.
 - Evidence, including raw grade and replay exports, workload round times, gate
   logs and scripts, is in
   `/Users/conan/Workspace/makefun-bounties/github-round4-evidence/`.
+
+### Priority 2 — push engine experiments
+
+Priority 2 started after the confirmed Priority 1 tree was committed. Each
+four-pair stage kept `2674543` as the official baseline. The candidate added
+one change to the specified preceding implementation. Ratios across stages
+describe the observed results of separate series.
+
+| Candidate stage | Change relative to its preceding implementation | Aggregate vs base | Push vs base | Decision |
+| --- | --- | ---: | ---: | --- |
+| Reusable inflate | Add native reset and one-shot inflate with public fallback to Priority 1 | -4.50% | -9.15% | Retained for lower push time |
+| Scratch-buffer SHA-1 | Hash the type and length prefix in the same buffer as the inflated bytes | -6.33% | -8.72% | Retained for lower aggregate time |
+| First-parent check | Add a direct commit-parent match to the scratch-hash stage | -3.81% | -7.92% | Reverted |
+| Inline pkt-line parser | Add a byte decoder to the scratch-hash stage | -4.40% | -7.52% | Reverted |
+
+Round 3's direct v0 advertisement experiment moved official aggregate time
+from 63,324 to 63,462 µs. Round 4 omitted that previously reverted change.
+
+
+#### Reusable inflate runs
+
+| Run | Load | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us | Feature | Agent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 2.84 | 83.875 | 27.278 | 210.144 | 31.042 | 62,155 | 600 | 200 |
+| Candidate 1 | 3.02 | 76.966 | 33.812 | 194.452 | 26.156 | 60,317 | 600 | 200 |
+| Base 2 | 2.73 | 83.044 | 27.683 | 210.296 | 30.772 | 62,105 | 600 | 200 |
+| Candidate 2 | 2.47 | 74.194 | 27.133 | 200.469 | 28.198 | 58,081 | 600 | 200 |
+| Base 3 | 2.44 | 83.855 | 28.384 | 214.057 | 30.256 | 62,659 | 600 | 200 |
+| Candidate 3 | 2.75 | 77.725 | 28.601 | 203.375 | 27.351 | 59,300 | 600 | 200 |
+| Base 4 | 2.66 | 88.250 | 27.568 | 217.819 | 30.149 | 63,223 | 600 | 200 |
+| Candidate 4 | 2.41 | 79.130 | 30.414 | 203.209 | 28.715 | 61,216 | 600 | 200 |
+
+Paired candidate/base ratios: 0.970429, 0.935207, 0.946392, 0.968255
+Aggregate paired geomean 0.954955 (-4.50%).
+Push paired geomean 0.908545 (-9.15%).
+Correctness gates across all runs: PASS.
+
+#### Scratch-buffer SHA-1 runs
+
+| Run | Load | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us | Feature | Agent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 2.13 | 81.429 | 29.924 | 211.579 | 31.514 | 63,488 | 600 | 200 |
+| Candidate 1 | 2.11 | 75.631 | 29.307 | 196.849 | 28.072 | 59,159 | 600 | 200 |
+| Base 2 | 1.72 | 85.807 | 26.203 | 212.895 | 29.535 | 61,319 | 600 | 200 |
+| Candidate 2 | 1.69 | 75.212 | 28.280 | 209.869 | 28.647 | 59,800 | 600 | 200 |
+| Base 3 | 2.13 | 83.815 | 31.168 | 211.595 | 30.475 | 64,065 | 600 | 200 |
+| Candidate 3 | 2.19 | 78.366 | 26.629 | 203.903 | 27.525 | 58,500 | 600 | 200 |
+| Base 4 | 2.07 | 82.791 | 28.068 | 202.955 | 30.034 | 61,348 | 600 | 200 |
+| Candidate 4 | 2.15 | 75.507 | 26.276 | 200.344 | 26.394 | 56,912 | 600 | 200 |
+
+Paired candidate/base ratios: 0.931814, 0.975228, 0.913135, 0.927691
+Aggregate paired geomean 0.936685 (-6.33%).
+Push paired geomean 0.912796 (-8.72%).
+Correctness gates across all runs: PASS.
+
+#### First-parent check runs
+
+| Run | Load | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us | Feature | Agent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 2.47 | 82.989 | 27.517 | 213.446 | 29.361 | 61,506 | 600 | 200 |
+| Candidate 1 | 2.57 | 75.113 | 27.202 | 202.455 | 29.054 | 58,879 | 600 | 200 |
+| Base 2 | 2.57 | 83.374 | 27.551 | 214.685 | 29.684 | 61,855 | 600 | 200 |
+| Candidate 2 | 2.58 | 77.423 | 28.329 | 198.266 | 28.371 | 59,266 | 600 | 200 |
+| Base 3 | 2.72 | 84.233 | 28.637 | 215.159 | 31.086 | 63,377 | 600 | 200 |
+| Candidate 3 | 2.56 | 89.856 | 45.811 | 208.360 | 29.034 | 70,641 | 600 | 200 |
+| Base 4 | 2.88 | 94.288 | 32.738 | 234.653 | 31.371 | 69,042 | 600 | 200 |
+| Candidate 4 | 3.57 | 75.605 | 27.704 | 191.830 | 27.824 | 57,824 | 600 | 200 |
+
+Paired candidate/base ratios: 0.957289, 0.958144, 1.114616, 0.837519
+Aggregate paired geomean 0.961941 (-3.81%).
+Push paired geomean 0.920817 (-7.92%).
+Correctness gates across all runs: PASS.
+
+#### Inline pkt-line parser runs
+
+| Run | Load | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us | Feature | Agent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 3.26 | 82.952 | 30.073 | 214.919 | 29.393 | 63,006 | 600 | 200 |
+| Candidate 1 | 3.34 | 88.003 | 32.100 | 201.671 | 28.741 | 63,612 | 600 | 200 |
+| Base 2 | 3.75 | 84.406 | 34.383 | 216.969 | 31.524 | 66,748 | 600 | 200 |
+| Candidate 2 | 3.59 | 77.592 | 27.535 | 196.890 | 26.850 | 57,972 | 600 | 200 |
+| Base 3 | 3.60 | 96.475 | 27.227 | 204.614 | 30.369 | 63,562 | 600 | 200 |
+| Candidate 3 | 3.88 | 77.967 | 34.540 | 204.258 | 27.907 | 62,594 | 600 | 200 |
+| Base 4 | 3.80 | 83.090 | 27.350 | 217.370 | 28.560 | 61,287 | 600 | 200 |
+| Candidate 4 | 3.30 | 77.113 | 29.650 | 197.873 | 27.319 | 59,293 | 600 | 200 |
+
+Paired candidate/base ratios: 1.009618, 0.868520, 0.984771, 0.967465
+Aggregate paired geomean 0.956042 (-4.40%).
+Push paired geomean 0.924799 (-7.52%).
+Correctness gates across all runs: PASS.
+
+#### Final combined tree
+
+| Run | Load | Push p50 (ms) | Clone p50 (ms) | Read p50 (ms) | Write p50 (ms) | perf_p50_us | Feature | Agent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base 1 | 2.56 | 84.038 | 28.162 | 203.535 | 29.497 | 61,396 | 600 | 200 |
+| Candidate 1 | 3.43 | 76.090 | 27.245 | 182.774 | 26.814 | 56,458 | 600 | 200 |
+| Base 2 | 3.14 | 88.117 | 29.144 | 222.951 | 28.773 | 63,709 | 600 | 200 |
+| Candidate 2 | 2.88 | 76.184 | 28.439 | 195.166 | 26.229 | 57,709 | 600 | 200 |
+| Base 3 | 2.75 | 82.303 | 28.069 | 205.840 | 29.941 | 61,427 | 600 | 200 |
+| Candidate 3 | 3.15 | 86.628 | 26.823 | 217.249 | 25.606 | 59,961 | 600 | 200 |
+| Base 4 | 2.98 | 80.038 | 29.749 | 202.131 | 32.729 | 62,999 | 600 | 200 |
+| Candidate 4 | 2.99 | 76.101 | 28.379 | 201.879 | 27.764 | 58,985 | 600 | 200 |
+| Base 5 | 2.90 | 82.967 | 30.212 | 198.268 | 28.394 | 61,290 | 600 | 200 |
+| Candidate 5 | 2.76 | 73.628 | 32.933 | 189.977 | 26.750 | 59,248 | 600 | 200 |
+
+Paired candidate/base ratios: 0.919571, 0.905822, 0.976134, 0.936285, 0.966683
+Aggregate paired geomean 0.940515 (-5.95%).
+Push paired geomean 0.929878 (-7.01%).
+Correctness gates across all runs: PASS.
+
+**GO.** Final aggregate p50 was 5.95% lower versus `2674543` across five pairs.
+The confirmed Priority 1 result was 4.21% lower over its own five pairs.
+All final pairs cleared Feature 600/600 and Agent 200/200. The grading ran in local Docker.
+
+### Final verification
+
+- Every official invocation in this round returned EXIT=0, with Feature 600/600
+  (120/120 checks), Agent 200/200 (MCP 15/15), Perf 200/200, all three timed
+  rounds per workload and successful L1 replay.
+- `npm test` on the pinned Node 22.23.4 Docker image returned EXIT=0 (12/12),
+  including the 64 MiB request boundary, raw transport tests, and pack tests for
+  copied object bytes, truncated and corrupt zlib data, and wrong object sizes.
+- The pinned-runtime pack differential matched 160 cases against `2674543`
+  in each of three modes (normal, missing capability and injected binding
+  failure). The normal mode observed 170 binding calls across 84 engines,
+  including engine disposal after malformed data. The Git differential
+  matched 1,180 pkt-line and ancestry cases. Both probes returned EXIT=0.
+- The pack reader still verifies the pack trailer before reading objects,
+  enforces the 64 MiB size ceiling, and publishes objects only after the
+  complete pack passes validation. The small-object path keeps independent
+  object bytes and falls back to `inflateSync()` after errors or size
+  mismatches and for objects over 16 KiB.
+- `node --check` for all four runtime files and three test files, the project
+  typecheck, staged and base-relative `git diff --check` runs, and the
+  `main.ts` unchanged check returned EXIT=0. The repository has no lint
+  command. Task containers auto-removed and test listeners closed.

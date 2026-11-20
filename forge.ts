@@ -1,5 +1,5 @@
 import { createHash, hash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { constants, createInflate, deflateSync, inflateSync, type Inflate } from 'node:zlib';
 
 export const ZERO_OID = '0'.repeat(40);
 export type ObjectType = 'commit' | 'tree' | 'blob' | 'tag';
@@ -89,6 +89,95 @@ function readObjectHeader(buffer: Buffer, start: number): { type: ObjectType; si
   return { type, size, next: offset };
 }
 
+const SMALL_INFLATE_LIMIT = 16 * 1024;
+const OBJECT_HEADER_SPACE = 32;
+
+interface InflateHandle {
+  reset(): void;
+  writeSync(flush: number, input: Buffer, start: number, length: number,
+    output: Buffer, outputStart: number, outputLength: number): void;
+}
+
+interface SmallInflater {
+  engine: Inflate;
+  handle: InflateHandle;
+  state: Uint32Array;
+  scratch: Buffer;
+}
+
+interface InflatedObject {
+  data: Buffer;
+  consumed: number;
+  oid: string;
+}
+
+// undefined means uninitialized or a discarded stream. null means no compatible binding.
+let smallInflater: SmallInflater | null | undefined;
+
+function createSmallInflater(): SmallInflater | null {
+  try {
+    const engine = createInflate({ chunkSize: SMALL_INFLATE_LIMIT }) as Inflate & {
+      _handle?: InflateHandle;
+      _writeState?: Uint32Array;
+    };
+    const handle = engine._handle;
+    const state = engine._writeState;
+    if (!handle || typeof handle.reset !== 'function' || typeof handle.writeSync !== 'function' ||
+        !(state instanceof Uint32Array) || state.length < 2) {
+      engine.close();
+      return null;
+    }
+    // A binding error destroys the stream synchronously and emits this event later.
+    engine.on('error', ignoreInflateError);
+    return { engine, handle, state, scratch: Buffer.allocUnsafe(OBJECT_HEADER_SPACE + SMALL_INFLATE_LIMIT + 1) };
+  } catch {
+    return null;
+  }
+}
+
+function ignoreInflateError(): void {}
+
+function inflateSmallObject(pack: Buffer, start: number, size: number, type: ObjectType): InflatedObject | undefined {
+  const length = pack.length - 20 - start;
+  if (length <= 0 || !Number.isInteger(size) || size > SMALL_INFLATE_LIMIT) return;
+  if (smallInflater === undefined) smallInflater = createSmallInflater();
+  const inflater = smallInflater;
+  if (!inflater) return;
+  const { engine, handle, state, scratch } = inflater;
+  try {
+    handle.reset();
+    if (!engine.destroyed) {
+      // An extra byte distinguishes a completed stream from one that filled its output.
+      handle.writeSync(constants.Z_FINISH, pack, start, length, scratch, OBJECT_HEADER_SPACE, size + 1);
+      const consumed = length - state[1];
+      if (!engine.destroyed && state[0] === 1 && consumed > 0 && consumed <= length) {
+        const prefix = `${type} ${size}\0`;
+        const objectStart = OBJECT_HEADER_SPACE - prefix.length;
+        const objectEnd = OBJECT_HEADER_SPACE + size;
+        scratch.write(prefix, objectStart, prefix.length, 'ascii');
+        const oid = hash('sha1', scratch.subarray(objectStart, objectEnd));
+        return { data: Buffer.from(scratch.subarray(OBJECT_HEADER_SPACE, objectEnd)), consumed, oid };
+      }
+    }
+  } catch {
+    // The public API below retains the original error and validation order.
+  }
+  smallInflater = undefined;
+  engine.close();
+}
+
+function inflatePackObject(pack: Buffer, start: number, size: number, type: ObjectType): InflatedObject {
+  const small = inflateSmallObject(pack, start, size, type);
+  if (small) return small;
+  const inflated = inflateSync(pack.subarray(start, -20), {
+    info: true,
+    maxOutputLength: Math.max(1, size),
+    chunkSize: Math.max(64, Math.min(SMALL_INFLATE_LIMIT, size)),
+  }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+  if (inflated.buffer.length !== size || !inflated.engine.bytesWritten) throw new Error('bad pack object size');
+  return { data: inflated.buffer, consumed: inflated.engine.bytesWritten, oid: hashObject(type, inflated.buffer) };
+}
+
 export function readPack(pack: Buffer): Map<string, GitObject> {
   if (pack.length < 32 || pack.subarray(0, 4).toString() !== 'PACK' || pack.readUInt32BE(4) !== 2) throw new Error('invalid pack');
   const trailer = pack.subarray(pack.length - 20);
@@ -100,16 +189,9 @@ export function readPack(pack: Buffer): Map<string, GitObject> {
   for (let index = 0; index < count; index += 1) {
     const header = readObjectHeader(pack, offset);
     if (header.size > MAX_OBJECT_BYTES) throw new Error('pack object is too large');
-    const inflated = inflateSync(pack.subarray(header.next, -20), {
-      info: true,
-      maxOutputLength: Math.max(1, header.size),
-      // Avoid reserving a 16 KiB output slab for every small loose object.
-      chunkSize: Math.max(64, Math.min(16 * 1024, header.size)),
-    }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
-    if (inflated.buffer.length !== header.size || !inflated.engine.bytesWritten) throw new Error('bad pack object size');
-    offset = header.next + inflated.engine.bytesWritten;
-    const object = { type: header.type, data: inflated.buffer };
-    result.set(hashObject(object.type, object.data), object);
+    const { data, consumed, oid } = inflatePackObject(pack, header.next, header.size, header.type);
+    offset = header.next + consumed;
+    result.set(oid, { type: header.type, data });
   }
   if (offset !== pack.length - 20) throw new Error('trailing pack bytes');
   return result;
